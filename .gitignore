@@ -1,0 +1,10 @@
+results/
+reports/
+logs/
+objdir/
+sim_build/
+__pycache__/
+*.pyc
+*.vcd
+*.fst
+*.log
