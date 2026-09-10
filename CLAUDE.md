@@ -12,11 +12,12 @@ to the six subagents in `.claude/agents/` and enforces the phase gates below.
 | Array shape          | 16 x 16 systolic        | Parameterized `N`; the spec may pick 8x8 for the first full-flow pass. |
 | Operand type         | INT8 x INT8 -> INT32 acc | Optional stretch: BF16. |
 | Target clock         | 100 MHz (sky130hd)      | Circuit designer may relax; spec must record the final number. |
-| PCIe boundary        | PIPE interface          | See "PCIe scope" below. |
+| PCIe boundary        | **TLP-level** (PIPE ruled out) | Phase 0 finding: `cocotbext-pcie` 0.2.16 exposes **no PIPE interface** at all (`grep -ri pipe` → nothing). CLAUDE.md's own rule "the endpoint boundary must be one it can attach to" wins over "boundary is PIPE", so the TLP-level fallback in "PCIe scope" below is **mandatory**, not optional. Exact form is the central Phase 1 decision; spec-writer records it in `docs/decisions.md`. |
 | Host access model    | BAR0-mapped registers + on-chip SRAM for A/B/C | DMA is a stretch goal, gated on Phase 4 passing. |
-| Simulator            | Verilator + cocotb      | Fallback: Icarus + cocotb. Validation specialist confirms what is installed. |
-| PCIe host model      | `cocotbext-pcie`        | The testbench never hand-writes TLP encode/decode; this library is the reference. The spec's endpoint boundary must be one it can attach to. |
+| Simulator            | **Icarus 12.0 + cocotb** | Phase 0 finding: cocotb 2.1.0 hard-errors on Verilator < 5.036 (`Makefile.verilator:29`, `VLT_MIN := 5.036`); this machine has 5.032 and apt offers no newer. Icarus hello-world passes (`TESTS=1 PASS=1`). **Verilator is still the linter** (`--lint-only -Wall`, unaffected by the floor) and Icarus was needed for Phase 4 GL sim anyway — Verilator has no SDF. |
+| PCIe host model      | `cocotbext-pcie` 0.2.16 | The testbench never hand-writes TLP encode/decode; this library is the reference. RTL-facing devices it ships: `xilinx.us.UltraScalePlusPcieDevice` (AXI-Stream CQ/CC/RQ/RC), `intel.ptile`, `intel.s10`. `core.RootComplex`/`MemoryEndpoint` are pure-Python with no RTL ports. |
 | HDL                  | SystemVerilog (synthesizable subset Yosys accepts) | No `interface`s, no unpacked struct ports; keep it Yosys-clean. |
+| Python / cocotb       | venv at `.venv/` (gitignored) | Python 3.14.4 is the only interpreter and is PEP 668 externally-managed, so the venv is mandatory. Contents: cocotb 2.1.0, cocotbext-pcie 0.2.16, cocotbext-axi 0.1.28, cocotb-bus 0.3.0. Invoke as `.venv/bin/python` / `.venv/bin/cocotb-config`. **cocotb 2.x, not 1.x** — see the API-change list in `docs/phase-reports/phase0-env.md` §7 before writing any test. |
 | ORFS install path    | `/home/pgratz/openroad/OpenROAD-flow-scripts` | Confirmed present on this machine. Source `${ORFS}/env.sh` to get `openroad`/`yosys` on `PATH`. Flow dir: `${ORFS}/flow`; platforms in `${ORFS}/flow/platforms/` (asap7, gf180, ihp-sg13g2, nangate45, sky130hd, sky130hs, sky130io, sky130ram). |
 
 ## PCIe scope (read this before arguing about PCIe)
