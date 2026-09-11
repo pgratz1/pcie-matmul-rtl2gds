@@ -60,6 +60,26 @@ to a full matrix multiply against a golden model. See
 [`docs/bugs.md`](docs/bugs.md) and
 [`docs/session-logs/`](docs/session-logs/).
 
+## Session logs — the full build, every turn
+
+The orchestrator and all six subagents kept complete transcripts: **3,042 turns**,
+including reasoning, tool calls and dead ends. Rendered readable in
+**[`docs/session-logs/`](docs/session-logs/)**.
+
+| Log | Participant | What's in it | Turns |
+|-----|-------------|--------------|-------|
+| [00](docs/session-logs/00-orchestrator.md) | orchestrator | Delegation, gate checks, independent verification | 510 |
+| [01](docs/session-logs/01-validation-specialist-phase0.md) | validation-specialist | Environment, tooling, simulator decision | 104 |
+| [02](docs/session-logs/02-spec-writer.md) | spec-writer | 127 requirements across five revisions | 282 |
+| [03](docs/session-logs/03-rtl-designer.md) | rtl-designer | 14 modules; the row-6 root cause | 284 |
+| [04](docs/session-logs/04-test-writer.md) | test-writer | Test plan, cocotb suite, golden model | 483 |
+| [05](docs/session-logs/05-rtl-reviewer.md) | rtl-reviewer | Two read-only rounds against the spec | 93 |
+| [06](docs/session-logs/06-validation-specialist.md) | validation-specialist | Mutation testing; found the row-6 defect | 743 |
+| [07](docs/session-logs/07-circuit-designer.md) | circuit-designer | Two full flows to GDS-II | 543 |
+
+[`docs/session-logs/README.md`](docs/session-logs/README.md) indexes the passages
+worth reading first.
+
 ## Layout
 
 ```
