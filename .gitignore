@@ -9,3 +9,14 @@ __pycache__/
 *.fst
 *.log
 .venv/
+
+# Gate-level / post-synthesis build artifacts (regenerable)
+tb/gl/build/
+tb/gl/postsyn/
+tb/gl/sim_build/
+*.vvp
+
+# Generated sky130 cell models — regenerate with flow/make_gl_models.sh
+# and tb/gl/build_sdf_models.py (PDK-derived, ~1600 files)
+tb/gl/models_sdf/
+flow/gl_models/
