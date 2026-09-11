@@ -1,7 +1,0 @@
-format: verilog
-input_paths:
-  - /home/pgratz/pcie-matmul/results/sky130hd/pcie_matmul/base/4_before_rsz_lec.v
-  - /home/pgratz/pcie-matmul/results/sky130hd/pcie_matmul/base/4_after_rsz_lec.v
-liberty_files:
- - /home/pgratz/openroad/OpenROAD-flow-scripts/flow/platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
-log_file: /home/pgratz/pcie-matmul/logs/sky130hd/pcie_matmul/base/4_rsz_lec_check.log
