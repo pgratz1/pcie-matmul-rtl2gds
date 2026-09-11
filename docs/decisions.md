@@ -191,6 +191,83 @@ overwrote it, and it keeps `mm_array` a pure compute block with one narrow outpu
 The cost is 2048 flops at `N = 8`, roughly 0.04 mm^2, which is affordable.
 Decided by: spec-writer.
 
+## 2026-09-10 — DEC-013: `IOWr` is handled on the posted path (deliberate deviation)
+**Context:** Phase 2b noticed that `docs/spec.md` §4.3 classifies I/O Write as posted.
+PCIe Base r6.0 §2.2.7 / Table 2-2 classifies it as **non-posted**, so a compliant
+completer answers an unsupported `IOWr` with a UR Completion instead of discarding it.
+The RTL follows the spec, so spec and RTL agree; the question is which of them to change.
+**Decision:** keep the simplification and record it. `IOWr` stays on the posted path:
+discarded, `STATUS.ERR_UNSUP_REQ` set, no Completion.
+**Reasoning:** BAR0 is the only BAR and it is a memory BAR; BAR1–BAR5 all read 0 and
+`Command.IOSE` has no effect, so the configuration space declares no I/O resources at
+all. A conforming root complex will therefore never route an I/O request here — the only
+possible source is deliberately malformed test stimulus. Handling `IOWr` on the posted
+path removes a decode case from `tlp_rx` and loses nothing a real host could observe.
+**Cost of reversing:** move `IOWr` from the posted row to the non-posted row of §4.3;
+it then acquires a UR Completion via the existing REQ-040 path, with no other change.
+Decided by: spec-writer, on rtl-reviewer's observation.
+
+## 2026-09-10 — Spec amendment batch, v1.0.0 -> v1.1.0
+Eleven items raised by rtl-designer, test-writer and the Phase 2b review, all
+non-blocking. Full detail is in the `docs/spec.md` change log; summarised here so the
+decision history is in one place.
+**Spec was wrong, RTL was right (3):** `mm_ctrl` issues the `k=0` operand read indices
+in `FETCH`, not `PRIME` — issuing in `PRIME` would double-count the `k=0` product
+because `clr_acc` is asserted only in `PRIME`; REQ-119 and REQ-120 were arithmetically
+impossible as written and are now stated in terms of `N`.
+**Mutually unsatisfiable or underdetermined (4):** REQ-012 (registered `irq`) versus
+REQ-080 (`irq` exactly equal to `|IRQ_STATUS`) could not both hold — REQ-080 now allows
+2 cycles, REQ-012 is untouched, because an unregistered `irq` would be a combinational
+path to a chip output; new REQ-124 covers `START`+`SOFT_RESET` written together while
+busy; new REQ-125 replaces REQ-071's unmappable "leaves `mem_c` unchanged" with the
+guarantee that actually holds mid-drain; new REQ-122/REQ-123 introduce the `D_WR`
+write-path constant so REQ-101's exact `4N+2` becomes observable at the chip pins.
+**Record-keeping (4):** `app_rdata_last` removed from §7.3 (dead signal, removed from
+RTL in the same round); `IOWr` recorded as DEC-013 above; REQ-077's three structurally
+unreachable collisions documented so they are not mistaken for a coverage hole; REQ-041's
+Message clause documented as unreachable with `cocotbext-pcie` (its `Tlp.pack_header()`
+raises for every `MSG_*` type), covered indirectly by `MWr64`/`IOWr`.
+**Numbering:** no existing REQ ID was renumbered or repurposed. REQ-001 … REQ-121 keep
+their v1.0.0 identities. Added REQ-122 … REQ-125. Reworded REQ-071, REQ-080, REQ-119,
+REQ-120 — those four route to test-writer for a re-check. Decided by: spec-writer.
+
+## 2026-09-10 — Spec correction, v1.1.0 -> v1.1.1: one definition of `t_start`
+**Context:** rtl-designer measured `D_WR = 1` and `DONE` at `t_beat + 4N + 2` (34 at
+`N=8`), while v1.1.0's new REQ-123 demanded `t_beat + D_WR + 4N + 2` (35). It reported
+rather than patching, which was correct.
+**Root cause (not the off-by-one):** v1.1.0 used "accepted" and "updated" loosely, so
+REQ-074 placed `t_start` at the cycle the `CTRL` write is *taken* while §9.6 placed it
+at the cycle the write becomes *visible*. Those are one cycle apart, and REQ-123 then
+added `D_WR` on top of a `4N+2` that already started at `t_beat` — double-counting the
+write path.
+**Decision:** option (b). REQ-123 reads `t_beat + 4*N + 2`. §9.6 now names `t_beat`,
+`t_start` and `t_commit` as three distinct terms, fixes `t_start = t_beat`, and states
+explicitly that `D_WR` is **not** a term in any latency formula — it survives only as
+the write-*visibility* invariant of REQ-122. Option (a) (`+ D_WR + 4N + 1`) was
+rejected: keeping `D_WR` in the formula is exactly what invited the double-count, and
+the `+1` correction would have looked arbitrary rather than derived.
+**No RTL change required**; the v1 RTL already satisfies the corrected REQ-123.
+Decided by: spec-writer, on rtl-designer's measurement.
+
+## 2026-09-10 — Spec correction, v1.1.1 -> v1.1.2
+**1. REQ-119 repaired a second time.** The v1.1.0 fix ("one maximal burst per operand",
+`ceil(N*N/4)` DW) was correct only up to `N = 8`. At `N = 16` an operand is 64 DW and at
+`N = 32` it is 256 DW, both over the 32-DW burst cap of REQ-018/REQ-056, so the
+requirement stayed unsatisfiable for two of the five legal `N` — the original defect
+class, relocated rather than removed. Burst count is now `ceil(ceil(N*N/4)/32)`.
+**Lesson recorded:** any requirement that names a burst size must be written as a
+function of `N` and checked against the 32-DW cap at `N = 32`, not just at the v1 value.
+REQ-120 was re-checked under the same lens and is correct unmodified (`ceil(N*N/32)`
+bursts; at `N = 32` the last burst ends exactly on the 4096-byte C region boundary).
+**2. REQ-126 added** for a behavior rtl-designer introduced in response to Phase 2b
+"Should fix" item 3: `CfgRd0`/`CfgWr0` with `Length != 1` is malformed (PCIe Base r6.0
+§2.2.7 fixes Configuration Requests at one DWORD) and is answered with UR, with surplus
+payload drained to `eop`. The RTL had the behavior but no requirement, so no test
+covered it. Clause (d) — that `STATUS.ERR_UNSUP_REQ` is set — is the one part **not** in
+the verified-behavior report; it is specified that way for consistency with §4.3's
+treatment of other malformed TLPs, and rtl-designer should confirm or flag it.
+Decided by: spec-writer, on test-writer's findings.
+
 ## 2026-09-10 — Open questions for the human (spec-writer, Phase 1)
 None of these block Phase 2. They are recorded so they are not silently omitted.
 

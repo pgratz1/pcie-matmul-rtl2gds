@@ -20,7 +20,9 @@
 //              mid-payload (REQ-020). Returns this block to IDLE so a truncated
 //              write burst can never deadlock the request path.
 //   wdata_*  : write payload, req_len beats, ascending addresses.
-//   rdata_*  : read payload, req_len beats, ascending addresses.
+//   rdata_*  : read payload, req_len beats, ascending addresses. There is no
+//              rdata_last: tlp_tx counts payload beats from the Completion
+//              Length field (removed from spec 7.3's table in v1.1.0).
 //   eng_*    : engine-side ports of mem_a / mem_b / mem_c and the reg_file
 //              control/status handshake, brought out for matmul_top to wire to
 //              matmul_engine.
@@ -62,7 +64,6 @@ module app_bar0 #(
     output logic                rdata_valid,
     input  logic                rdata_ready,
     output logic [31:0]         rdata,
-    output logic                rdata_last,
 
     // Error event from the transaction layer
     input  logic                ev_unsup_req,
@@ -116,7 +117,6 @@ module app_bar0 #(
     assign wdata_ready = (state == S_WR);
     assign rdata_valid = rd_v;
     assign rdata       = rd_data_r;
-    assign rdata_last  = rd_last_r;
 
     // ---- byte enables for the current burst beat -------------------------
     logic       last_beat;

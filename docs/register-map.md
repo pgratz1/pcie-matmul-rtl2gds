@@ -1,6 +1,6 @@
 # BAR0 Register Map — PCIe-Attached Matrix Multiplier
 
-**Version: 1.0.0 — matches `docs/spec.md` v1.0.0**
+**Version: 1.1.2 — matches `docs/spec.md` v1.1.2**
 **Date: 2026-09-10**
 **Owner: spec-writer**
 
@@ -110,17 +110,17 @@ in byte 0, so a write only has effect if `First BE[0]` = 1.
 | Bits | Name | Access | Reset | Description |
 |------|------|--------|-------|-------------|
 | 31:2 | — | WO | — | Reserved. Writes ignored. |
-| 1 | `SOFT_RESET` | WO | — | Writing 1 returns `mm_ctrl` to IDLE, clears `STATUS.BUSY`, `STATUS.DONE`, all `STATUS` error bits, `PERF_CYCLES`, and all PE accumulators, within 2 clock cycles. Leaves matrices A/B/C, `SCRATCH`, `IRQ_ENABLE`, `OP_COUNT` and the entire PCI configuration space (including BAR0) unchanged. Takes precedence over `START` if both are written 1 in the same DWORD. |
+| 1 | `SOFT_RESET` | WO | — | Writing 1 returns `mm_ctrl` to IDLE, clears `STATUS.BUSY`, `STATUS.DONE`, all `STATUS` error bits, `PERF_CYCLES`, and all PE accumulators, within 2 clock cycles. Leaves matrices A and B, `SCRATCH`, `IRQ_ENABLE`, `OP_COUNT` and the entire PCI configuration space (including BAR0) unchanged, and does not itself modify C. Takes precedence over `START` if both are written 1 in the same DWORD, including while `STATUS.BUSY` = 1, in which case `START` is ignored entirely and `STATUS.ERR_START_BUSY` reads 0 afterwards. **If `SOFT_RESET` lands mid-drain, C is left in a defined but mixed state: every word holds either its pre-operation value or its correct new value. Software must treat C as invalid and re-run the operation.** |
 | 0 | `START` | WO | — | Writing 1 while `STATUS.BUSY` = 0 starts one `C = A x B` operation: `STATUS.BUSY` sets, `STATUS.DONE` clears, all PE accumulators clear to 0. Writing 1 while `STATUS.BUSY` = 1 has no effect on the running operation and sets `STATUS.ERR_START_BUSY`. |
 
-Spec cross-reference: REQ-068 … REQ-073.
+Spec cross-reference: REQ-068 … REQ-073, REQ-124, REQ-125.
 
 ### 3.5 `STATUS` — 0x0010 — mixed — reset `0x00000000`
 
 | Bits | Name | Access | Reset | Description |
 |------|------|--------|-------|-------------|
 | 31:5 | — | RO | 0 | Reserved. Reads 0, writes ignored. |
-| 4 | `ERR_UNSUP_REQ` | W1C | 0 | Set when the device receives an Unsupported Request: a Memory Read/Write that misses BAR0 or arrives with `Command.MSE` = 0, an `MRd`/`MWr` longer than 32 DW, a 64-bit-address or I/O or atomic or Message or Type 1 config request, or any TLP with `TD` = 1 or `EP` = 1. **Not** set by a Type 0 config request to a non-zero Device or Function number (which happens on every bus scan). |
+| 4 | `ERR_UNSUP_REQ` | W1C | 0 | Set when the device receives an Unsupported Request: a Memory Read/Write that misses BAR0 or arrives with `Command.MSE` = 0, an `MRd`/`MWr` longer than 32 DW, a 64-bit-address or I/O or atomic or Message or Type 1 config request, a Type 0 config request whose `Length` is not 1 (spec REQ-126), or any TLP with `TD` = 1 or `EP` = 1. **Not** set by a Type 0 config request to a non-zero Device or Function number (which happens on every bus scan). |
 | 3 | `ERR_WRITE_BUSY` | W1C | 0 | Set when a host write targets region A, B or C while `STATUS.BUSY` = 1. The write is discarded. |
 | 2 | `ERR_START_BUSY` | W1C | 0 | Set when `CTRL.START` is written 1 while `STATUS.BUSY` = 1. The running operation is unaffected. |
 | 1 | `DONE` | W1C | 0 | Set on the cycle the operation completes, `4*N + 2` cycles after `CTRL.START` was accepted. Persists until written with 1, or until `CTRL.SOFT_RESET` or `rst`. |
@@ -154,7 +154,7 @@ Spec cross-reference: REQ-079 … REQ-081.
 
 | Bits | Name | Access | Reset | Description |
 |------|------|--------|-------|-------------|
-| 31:0 | `MASKED` | RO | `0x00000000` | Bitwise `STATUS & IRQ_ENABLE`, evaluated continuously. Writes are ignored. The top-level output `irq` is 1 if and only if this register is non-zero. |
+| 31:0 | `MASKED` | RO | `0x00000000` | Bitwise `STATUS & IRQ_ENABLE`, evaluated continuously. Writes are ignored. The top-level output `irq` is a **registered** signal that tracks `MASKED != 0` within 2 clock cycles in both directions (it cannot be exactly equal, because it is registered — see spec REQ-012 and REQ-080). |
 
 There is **no MSI and no MSI-X**. The PCI configuration space contains no capability
 list, so the host cannot enable message-signalled interrupts. Software must either
@@ -168,7 +168,7 @@ Spec cross-reference: REQ-079, REQ-080, REQ-081, REQ-012.
 |------|------|--------|-------|-------------|
 | 31:0 | `CYCLES` | RO | `0x00000000` | Number of clock cycles taken by the most recently completed operation, counted from the cycle after `CTRL.START` was accepted through the cycle on which `STATUS.DONE` was set, inclusive. Equals `4*N + 2` (34 for `N = 8`). Cleared by `rst` and by `CTRL.SOFT_RESET`. Reads `0` if no operation has completed since the last reset. |
 
-Spec cross-reference: REQ-082, REQ-101, REQ-102.
+Spec cross-reference: REQ-082, REQ-101, REQ-102, REQ-123.
 
 ### 3.9 `SCRATCH` — 0x0020 — RW — reset `0x00000000`
 

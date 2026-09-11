@@ -69,7 +69,7 @@ needed (REQ-113).
 |------|--------|
 | header DW2 accepted -> `app_req_valid` | 1 |
 | BAR0 read request accepted -> first read DWORD | 2, then 1 DWORD/cycle |
-| write payload DWORD accepted -> storage updated | 1 |
+| write payload DWORD accepted -> storage updated (`D_WR`, REQ-122) | **1**, for every region, burst position, Byte Enable pattern and `N` |
 | `CTRL.START` accepted -> `STATUS.DONE` reads 1 | `4N+2` (34 at `N=8`) |
 | `mm_pe` operand in -> operand out | 1 (fixed by DEC-009) |
 | `IRQ_STATUS` change -> `irq` pin | 1 (registered output, REQ-012/REQ-081) |
@@ -81,6 +81,17 @@ verilator --lint-only -Wall -Wno-DECLFILENAME --top-module matmul_top $(cat rtl/
 yosys -p "read_verilog -sv $(cat rtl/filelist.f); hierarchy -top matmul_top; synth; stat"
 ```
 
-The only lint suppression in the tree is one narrow `WIDTHCONCAT` pair around
-the `mem_c` reset fill (`mem_c.sv`), which is 32768 bits wide at `N = 32` by
-construction; justification is in the source.
+Both are clean at `N` = 2, 4, 8, 16 and 32.
+
+The only lint suppressions in the tree are three narrow `UNUSEDSIGNAL` pairs,
+each wrapping only the declarations it covers and each justified in the source:
+
+| File | Covers | Why |
+|------|--------|-----|
+| `mm_array.sv` | `a_o`, `b_o`, `v_o` | The east column's `a_out`/`v_out` and the south row's `b_out` leave the mesh with no consumer, by construction of the spec §12.4 dataflow. |
+| `tlp_rx.sv` | `dw0_r`, `dw2_r` | Header fields spec §7.2 says are ignored on receive (T9, T8, LN, TH, AT, PH) plus `Address[15:14]`, which is above the BAR0 window. |
+| `pcie_cfg_space.sv` | `req_wdata` | Bits [13:8] land on `Command[15:8]` and `BAR0[13:8]`, both RO 0. |
+
+Spec v1.1.0 alignment: `D_WR` = 1 (REQ-122); REQ-124 and REQ-125 hold; `mem_c`
+resets one `N`-word row per iteration of a static loop so the reset fill never
+exceeds `N*ACCW` bits and no `WIDTHCONCAT` suppression is needed at `N = 32`.

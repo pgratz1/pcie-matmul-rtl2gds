@@ -76,17 +76,22 @@ module mem_c #(
     endgenerate
 
     // ---- drain row write -------------------------------------------------
+    localparam int NROW = (1 << WIW) / N;   // rows of N words in mem
+
+    integer         ri;
     logic [BOW-1:0] d_boff;
     assign d_boff = BOW'(d_row) * BOW'(N * ACCW);
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            // Justified narrow suppression: the '0 fill is MEMBITS wide by
-            // construction (32768 bits at N = 32) and REQ-092 requires every C
-            // word to reset to 0, so the wide replication is intended.
-            // verilator lint_off WIDTHCONCAT
-            mem <= '0;
-            // verilator lint_on WIDTHCONCAT
+            // Reset one row of N words at a time. A single MEMBITS-wide '0 fill
+            // is 32768 bits at N = 32, which trips Verilator's WIDTHCONCAT
+            // "more than 8k bit replication" heuristic; each row fill is
+            // N*ACCW bits. The loop bound is static, so this unrolls to the
+            // same flop reset (REQ-092) with no extra logic.
+            for (ri = 0; ri < NROW; ri = ri + 1) begin
+                mem[ri[BOW-1:0] * BOW'(N * ACCW) +: N*ACCW] <= '0;
+            end
         end else if (d_wr_en) begin
             mem[d_boff +: N*ACCW] <= d_data;
         end else if (h_wr && h_in_range) begin

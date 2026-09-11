@@ -52,9 +52,17 @@ module mm_array #(
 );
 
     // Per-PE registered outputs, flattened as index (i*N + j).
+    // The east column's a_out/v_out and the south row's b_out leave the mesh and
+    // have no consumer by construction of the dataflow (spec 12.4): A and the
+    // valid bit exit to the east, B exits to the south, and only the south
+    // accumulator bus is read. Suppressed at the declarations rather than sunk
+    // in a reduction-OR, which would synthesise a dead cone of N*N*(2*DW+1)
+    // bits (4608 at N = 8, 73728 at N = 32).
+    // verilator lint_off UNUSEDSIGNAL
     logic [N*N*DW-1:0]   a_o;
     logic [N*N*DW-1:0]   b_o;
     logic [N*N-1:0]      v_o;
+    // verilator lint_on UNUSEDSIGNAL
     logic [N*N*ACCW-1:0] acc_o;
 
     genvar gi, gj;
@@ -108,11 +116,5 @@ module mm_array #(
                        acc_o[((N-1)*N + gj)*ACCW +: ACCW];
         end
     endgenerate
-
-    // The east column's a_out/v_out and the south row's b_out leave the array
-    // and have no consumer by construction. Sink them so the linter can see
-    // the omission is deliberate.
-    logic unused_edge_outputs;
-    assign unused_edge_outputs = |{a_o, b_o, v_o, acc_o};
 
 endmodule

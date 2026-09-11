@@ -28,8 +28,14 @@
 // Latency: cpl_req accepted at cycle t -> header DW0 presented at cycle t+1,
 //          then one DWORD per cycle when tx_tlp_ready is high.
 //
-// Implements: REQ-006, REQ-007, REQ-023 ... REQ-027, REQ-031, REQ-033 ...
-//             REQ-035, REQ-009.
+// Implements: REQ-002 (an unbounded tx_tlp_ready-low stall only holds the FSM
+//             in its current beat), REQ-004 (sop is asserted only in T_DW0 and
+//             eop no earlier than T_DW2, so exactly one TLP lies between them
+//             and the two are never coincident), REQ-005 (stall cycles may fall
+//             anywhere inside the packet; no second TLP is started until
+//             T_IDLE is re-entered, so completions never interleave),
+//             REQ-006, REQ-007, REQ-009, REQ-023 ... REQ-027, REQ-031,
+//             REQ-033 ... REQ-035.
 // ---------------------------------------------------------------------------
 module tlp_tx (
     // Clock and reset
@@ -152,6 +158,7 @@ module tlp_tx (
             end
         endcase
         if (rst) begin
+            tx_tlp_data  = 32'h0000_0000;   // spec 13.4 reset value
             tx_tlp_sop   = 1'b0;
             tx_tlp_eop   = 1'b0;
             tx_tlp_valid = 1'b0;

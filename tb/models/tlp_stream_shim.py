@@ -25,6 +25,8 @@ import cocotb
 from cocotb.queue import Queue
 from cocotb.triggers import Event, RisingEdge, Timer
 
+from cocotb.utils import get_sim_time
+
 from cocotbext.pcie.core.device import Device
 from cocotbext.pcie.core.tlp import Tlp
 
@@ -33,6 +35,13 @@ from .golden import tlp_to_dwords, dwords_to_bytes
 
 class ProtocolError(AssertionError):
     """A DUT violation of the spec 5.2 stream contract."""
+
+
+CLK_PERIOD_NS = 10          # must match models.host.CLK_PERIOD_NS
+
+
+def _cycle_now():
+    return int(round(get_sim_time("ns") / CLK_PERIOD_NS))
 
 
 def _i(sig, name):
@@ -91,6 +100,16 @@ class TlpStreamShim(Device):
         # of being forwarded to the root complex.  Used for raw-injection tests
         # whose requests the RootComplex never issued and would not route.
         self.capture = None
+
+        # Exact cycle of the most recent inbound beat / end-of-packet beat,
+        # in the numbering of models.host.cycle_now().  `last_eop_cycle` is
+        # `t_beat` for the payload DWORD of a single-DWORD write (spec 9.6).
+        self.last_beat_cycle = None
+        self.last_eop_cycle = None
+        # Per-beat cycle list of the most recently completed inbound packet,
+        # so a test can name the exact beat that carried a given payload
+        # DWORD (REQ-122's burst-position clause needs that, not the eop).
+        self.last_packet_beat_cycles = []
 
         # Counters/flags for the protocol checker
         self.tx_packets = 0
@@ -184,6 +203,7 @@ class TlpStreamShim(Device):
         beats = []
         idx = 0
         tlp = None
+        beat_cycles = []
 
         while True:
             await RisingEdge(self.clk)
@@ -197,13 +217,22 @@ class TlpStreamShim(Device):
                 self.dut.rx_tlp_eop.value = 0
                 self._rx_valid = 0
                 beats, idx, tlp = [], 0, None
+                beat_cycles = []
                 continue
 
             ready = _i(self.dut.rx_tlp_ready, "rx_tlp_ready")
 
             if self._rx_valid and ready:
+                # valid && ready held during the cycle just ended, so that is
+                # the cycle the beat transferred on (spec 9.6 wording).
+                self.last_beat_cycle = _cycle_now() - 1
+                beat_cycles.append(self.last_beat_cycle)
+                if beats[idx][2]:                       # eop
+                    self.last_eop_cycle = self.last_beat_cycle
                 idx += 1
                 if idx >= len(beats):
+                    self.last_packet_beat_cycles = beat_cycles
+                    beat_cycles = []
                     # whole TLP transferred: release flow-control credit so a
                     # long test cannot starve the behavioral DLL (spec 4.4)
                     if tlp is not None:

@@ -33,8 +33,12 @@
 // Latency: header DW0 accepted at t, DW2 at t+2 (no stalls) -> app_req_valid
 //          at t+3.
 //
-// Implements: REQ-008, REQ-013 ... REQ-022, REQ-028 ... REQ-032, REQ-036 ...
-//             REQ-044, REQ-050, REQ-052, REQ-053, REQ-054.
+// Implements: REQ-002 (rx_tlp_ready may be held low for an unbounded number of
+//             cycles - it is low for the whole service+completion window and no
+//             beat is lost), REQ-005 (idle and stall cycles may fall anywhere
+//             inside a TLP; the framing FSM only advances on valid && ready),
+//             REQ-008, REQ-013 ... REQ-022, REQ-028 ... REQ-032,
+//             REQ-036 ... REQ-044, REQ-050, REQ-052, REQ-053, REQ-054.
 // ---------------------------------------------------------------------------
 module tlp_rx (
     // Clock and reset
@@ -103,13 +107,6 @@ module tlp_rx (
     output logic         ev_unsup_req
 );
 
-    // Header bits the design deliberately ignores: DW0 T9/T8/LN/TH/AT
-    // (spec 7.2.1 says "ignored on receive") and DW2 PH[1:0] plus
-    // Address[15:14], which lie above the 16 KiB BAR0 window and are only used
-    // through the combinational BAR compare at decode time. Explicit sinks so
-    // the omission is visible to the linter.
-    logic unused_hdr_bits;
-
     // ---- TLP classification ---------------------------------------------
     localparam logic [2:0] CLS_MWR       = 3'd0;  // accepted MWr to BAR0
     localparam logic [2:0] CLS_MRD       = 3'd1;  // accepted MRd from BAR0
@@ -134,9 +131,16 @@ module tlp_rx (
     } state_e;
 
     state_e      state;
+    // Header bits the design deliberately ignores: DW0 T9[23], T8[19], LN[17],
+    // TH[16] and AT[11:10] are "ignored on receive" per spec 7.2.1; DW2 PH[1:0]
+    // is ignored per spec 7.2.2 and DW2 Address[15:14] lies above the 16 KiB
+    // BAR0 window and is consumed only by the combinational BAR compare on
+    // rx_tlp_data at decode time.
+    // verilator lint_off UNUSEDSIGNAL
     logic [31:0] dw0_r;
-    logic [31:0] dw1_r;
     logic [31:0] dw2_r;
+    // verilator lint_on UNUSEDSIGNAL
+    logic [31:0] dw1_r;
     logic [2:0]  cls_r;
     logic [5:0]  len_r;
     logic [5:0]  wbeat;
@@ -165,6 +169,7 @@ module tlp_rx (
     logic [9:0]  len_raw;
     logic [5:0]  len6;
     logic        len_ok;
+    logic        cfg_len_ok;
     logic        is_cpl;
     logic        is_msg;
     logic        is_mem;
@@ -187,6 +192,10 @@ module tlp_rx (
     assign len_raw = dw0_r[9:0];
     assign len6    = len_raw[5:0];
     assign len_ok  = (len_raw != 10'd0) && (len_raw <= 10'd32);
+    // Spec 7.2.3 fixes Length at 1 for CfgRd0/CfgWr0. Anything else is an
+    // unsupported request, so surplus payload DWORDs can never be left in the
+    // stream to be mistaken for a header.
+    assign cfg_len_ok = (len_raw == 10'd1);
 
     assign is_cpl  = (ttype == 5'b01010);
     assign is_msg  = (ttype[4:3] == 2'b10);
@@ -209,7 +218,7 @@ module tlp_rx (
             cls_c = CLS_DROP;
         end else if (td_bit || ep_bit) begin
             cls_c = posted ? CLS_DROP_ERR : CLS_UR_ERR;
-        end else if (is_cfg0 && fmt_3dw) begin
+        end else if (is_cfg0 && fmt_3dw && cfg_len_ok) begin
             if (!devfn_ok)      cls_c = CLS_UR_NOERR;   // bus scan, not an error
             else if (fmt_wr)    cls_c = CLS_CFGWR;
             else                cls_c = CLS_CFGRD;
@@ -408,8 +417,5 @@ module tlp_rx (
             end
         end
     end
-
-    assign unused_hdr_bits = |{dw0_r[23], dw0_r[19], dw0_r[17:16], dw0_r[11:10],
-                               dw2_r[15:14], dw2_r[1:0]};
 
 endmodule

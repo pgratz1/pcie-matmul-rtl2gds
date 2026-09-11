@@ -15,7 +15,14 @@ from cocotb.triggers import ClockCycles, RisingEdge
 from tb_common import (G, assert_matrix_equal, clear_status, discover_n,
                        load_ab, make_tb, mrd, mrd_dword, mwr_burst, mwr_dword,
                        random_matrix, read_c, run_op, start_op, wait_done,
-                       wait_for, TbTimeout)
+                       wait_for, TbTimeout, measure_d_wr, cycle_now,
+                       wait_value_cycle, inject_and_get_beat)
+
+MAX_BURST_DW = 32          # REQ-018 / REQ-056 cap on any single MRd or MWr
+
+
+def ceil_div(a, b):
+    return -(-a // b)
 
 
 def zeros(n):
@@ -233,16 +240,18 @@ async def test_matmul_read_abc_while_busy(dut):
     assert_matrix_equal(got, exp, "C after reads were issued while BUSY")
 
 
-@cocotb.test(timeout_time=400, timeout_unit="us")
+@cocotb.test(timeout_time=600, timeout_unit="us")
 async def test_matmul_done_timing(dut):
-    """REQ-074, REQ-082, REQ-101, REQ-102, REQ-103, REQ-096, REQ-099.
+    """REQ-123 (spec v1.1.1) and REQ-074, REQ-082, REQ-101, REQ-102, REQ-103.
 
-    PERF_CYCLES is the exactly-specified, exactly-observable form of the
-    4N+2 latency and is checked as an exact constant.  The chip-boundary
-    measurement (START beat -> irq) is bounded rather than exact because the
-    spec does not fix the number of cycles between a beat being accepted on
-    rx_tlp_* and the CTRL write reaching reg_file (spec 7.3 says "no later
-    than", spec 6.2 and 9.6 only give the app_bar0-relative numbers).
+    REQ-123 is the boundary-observable form of REQ-101: with a CTRL write
+    whose payload DWORD carries bit 0 and transfers at cycle `t_beat` while
+    BUSY is 0, `STATUS.DONE` is set at exactly `t_beat + 4*N + 2`.  Spec
+    v1.1.1 fixes `t_start = t_beat` and deliberately excludes `D_WR` from
+    every latency formula -- adding it would double-count the write path.
+
+    DONE is observed through `irq`, which REQ-012 makes a registered copy of
+    |IRQ_STATUS: exactly one cycle of lag, so `t_done = t_irq - 1`.
     """
     tb = await make_tb(dut)
     n = await discover_n(tb)
@@ -251,40 +260,42 @@ async def test_matmul_done_timing(dut):
     await mwr_dword(tb, G.REG_IRQ_ENABLE, G.ST_DONE)
     await mwr_dword(tb, G.REG_STATUS, G.ST_W1C_MASK)
     assert int(dut.irq.value) == 0, "irq should be low before the operation"
+    st = await tb.read_dword(G.REG_STATUS)
+    assert st & G.ST_BUSY == 0, (
+        f"REQ-074: STATUS = 0x{st:08x}; BUSY must be 0 at t_beat for REQ-123 "
+        "to apply")
 
     start = tb.make_mem_write(tb.bar0_addr + G.REG_CTRL,
                               G.CTRL_START.to_bytes(4, "little"))
-    await tb.shim.inject(start)
-    await tb.shim.wait_rx_idle()
+    cap = tb.shim.start_capture()
+    try:
+        watcher = cocotb.start_soon(
+            wait_value_cycle(dut.clk, dut.irq, 1, "irq", 8 * expected + 64))
+        t_beat = await inject_and_get_beat(tb, start, payload_index=0)
+        t_irq = await watcher
+    finally:
+        tb.shim.stop_capture()
 
-    delta = 0
-    for _ in range(4 * expected + 64):
-        await RisingEdge(dut.clk)
-        delta += 1
-        if int(dut.irq.value) == 1:
-            break
-    else:
-        raise TbTimeout(
-            f"irq never asserted within {4 * expected + 64} cycles of the "
-            f"CTRL.START write being accepted on rx_tlp_*; REQ-101 requires "
-            f"DONE {expected} cycles after START and REQ-080 requires irq to "
-            "follow IRQ_STATUS")
-
-    lo, hi = expected, expected + 5
-    assert lo <= delta <= hi, (
-        f"REQ-101/REQ-012: irq rose {delta} cycles after the CTRL.START beat "
-        f"was accepted on rx_tlp_*.  4*N+2 = {expected} cycles for N = {n}, "
-        f"plus at most 3 cycles of rx_tlp -> reg_file pipeline (spec 7.3) and "
-        f"1 cycle for the registered irq output (REQ-012), so the legal "
-        f"window is [{lo}, {hi}]")
-    dut._log.info("START beat -> irq: %d cycles (4N+2 = %d)", delta, expected)
+    t_done = t_irq - 1                       # REQ-012: irq lags by one cycle
+    exp_done = t_beat + expected
+    dut._log.info("REQ-123: t_beat=%d, 4N+2=%d -> DONE at %d (expected %d), "
+                  "irq at %d", t_beat, expected, t_done, exp_done, t_irq)
+    assert t_done == exp_done, (
+        f"REQ-123: STATUS.DONE was set at cycle {t_done}, but the CTRL.START "
+        f"payload DWORD transferred at cycle {t_beat}, so spec 9.6 (v1.1.1) "
+        f"requires it at exactly t_beat + 4*N + 2 = {t_beat} + {expected} = "
+        f"{exp_done}.  Off by {t_done - exp_done}.\n"
+        f"  DONE is inferred from irq rising at cycle {t_irq}; REQ-012 makes "
+        "irq a registered copy of |IRQ_STATUS, so DONE is exactly one cycle "
+        "earlier.  Note that D_WR is deliberately NOT a term here (spec 9.6: "
+        "t_start = t_beat); adding it would double-count the write path.")
 
     pc = await tb.read_dword(G.REG_PERF_CYCLES)
     assert pc == expected, (
         f"REQ-102/REQ-082: PERF_CYCLES = {pc}; spec 12.5 fixes the operation "
         f"at 1 (PRIME) + 1 (FETCH) + {3 * n - 2} (COMPUTE) + 1 (TURN) + {n} "
-        f"(DRAIN) + 1 (FINISH) = 4*N+2 = {expected} cycles, so this register "
-        "always reads exactly that")
+        f"(DRAIN) + 1 (FINISH) = 4*N+2 = {expected} cycles.  REQ-123 and "
+        "REQ-101 must agree with it.")
 
     st = await tb.read_dword(G.REG_STATUS)
     assert st & G.ST_DONE, f"REQ-075: STATUS = 0x{st:08x}, DONE must be set"
@@ -384,53 +395,115 @@ async def test_matmul_storage_raz_wi_beyond_nn(dut):
                 f"offsets at or past {limit} bytes into the region are RAZ/WI")
 
 
-@cocotb.test(timeout_time=1200, timeout_unit="us")
+@cocotb.test(timeout_time=1500, timeout_unit="us")
 async def test_matmul_write_granularity_equivalence(dut):
-    """REQ-119: burst-written and byte-written operands give the same C.
+    """REQ-119 (reworded v1.1.0, corrected v1.1.2).
 
-    (spec 15 REQ-119 says "a single 32-DW MWr burst"; at N = 8 the whole of A
-    is 16 DW and the whole of B is another 16 DW, and they live in different
-    4 KiB regions, so "one burst per operand" is the largest burst that can
-    describe this.  A genuine 32-DW burst is exercised in test_tlp.py.)
+    Loading A and B with the minimum number of maximal bursts must leave
+    `mem_a` and `mem_b` holding exactly the same bytes as loading the same
+    data with `2*DW_op` single-DW `MWr` TLPs, and the operation afterwards
+    must produce identical C.
+
+    Spec v1.1.2 states this as the minimum number of maximal bursts,
+    `ceil(DW_op/32)` per operand where `DW_op = ceil(N*N/4)`, which is what
+    this test computes: one 16-DW burst per operand at N=8, two 32-DW bursts
+    at N=16, eight at N=32 -- always versus `2*DW_op` single-DW writes.
+    (v1.1.0's "one maximal burst per operand" was unsatisfiable for N >= 16
+    because DW_op exceeds the 32-DW cap of REQ-018/REQ-056; reported and
+    fixed in v1.1.2.)
     """
     tb = await make_tb(dut)
     n = await discover_n(tb)
     rng = random.Random(tb.seed ^ 0xC0FFEE)
 
+    dw_per_operand = ceil_div(n * n, 4)
+    bursts_per_operand = ceil_div(dw_per_operand, MAX_BURST_DW)
+
     a, b = random_matrix(rng, n), random_matrix(rng, n)
     exp = G.matmul_golden(a, b, n)
+    a_bytes, b_bytes = G.a_to_bytes(a, n), G.b_to_bytes(b, n)
 
-    # (1) one burst per operand
-    await tb.mem_write(G.MEM_A_BASE, G.a_to_bytes(a, n))
-    await tb.mem_write(G.MEM_B_BASE, G.b_to_bytes(b, n))
+    # --- (1) maximal bursts, counted -------------------------------------
+    await tb.mem_write(G.MEM_A_BASE, bytes(n * n))
+    await tb.mem_write(G.MEM_B_BASE, bytes(n * n))
+    before = tb.shim.rx_packets
+    cap = tb.shim.start_capture()
+    try:
+        for base, data in ((G.MEM_A_BASE, a_bytes), (G.MEM_B_BASE, b_bytes)):
+            off = 0
+            while off < dw_per_operand:
+                ndw = min(MAX_BURST_DW, dw_per_operand - off)
+                await tb.shim.inject(tb.make_mem_write(
+                    tb.bar0_addr + base + 4 * off,
+                    data[4 * off:4 * (off + ndw)],
+                    first_be=0xF, last_be=0xF))
+                off += ndw
+        await tb.shim.wait_rx_idle()
+        await ClockCycles(dut.clk, 8)
+    finally:
+        tb.shim.stop_capture()
+    framed = tb.shim.rx_packets - before
+    assert framed == 2 * bursts_per_operand, (
+        f"internal: {framed} burst TLPs were framed, expected "
+        f"{2 * bursts_per_operand} ({bursts_per_operand} per operand)")
+
+    a_burst = bytes(await tb.mem_read(G.MEM_A_BASE, n * n))
+    b_burst = bytes(await tb.mem_read(G.MEM_B_BASE, n * n))
+    assert a_burst == a_bytes and b_burst == b_bytes, (
+        "REQ-119: the burst-written A/B bytes do not match what was sent")
     await run_op(tb)
     c_burst = await read_c(tb, n)
     assert_matrix_equal(c_burst, exp, "C after burst-written operands")
 
-    # (2) wipe, then write every byte with its own single-DW MWr + byte enable
+    # --- (2) 2*ceil(N*N/4) single-DWORD writes ---------------------------
     await tb.mem_write(G.MEM_A_BASE, bytes(n * n))
     await tb.mem_write(G.MEM_B_BASE, bytes(n * n))
-
-    abytes, bbytes = G.a_to_bytes(a, n), G.b_to_bytes(b, n)
+    before = tb.shim.rx_packets
     writes = []
-    for m in range(n * n):
-        writes.append((G.MEM_A_BASE + (m & ~3), abytes[m] << (8 * (m & 3)),
-                       1 << (m & 3)))
-        writes.append((G.MEM_B_BASE + (m & ~3), bbytes[m] << (8 * (m & 3)),
-                       1 << (m & 3)))
+    for k in range(dw_per_operand):
+        writes.append((G.MEM_A_BASE + 4 * k,
+                       int.from_bytes(a_bytes[4 * k:4 * k + 4], "little"), 0xF))
+        writes.append((G.MEM_B_BASE + 4 * k,
+                       int.from_bytes(b_bytes[4 * k:4 * k + 4], "little"), 0xF))
     await mwr_burst(tb, writes)
+    framed = tb.shim.rx_packets - before
+    assert framed == 2 * dw_per_operand, (
+        f"internal: {framed} single-DWORD TLPs were framed, expected "
+        f"{2 * dw_per_operand}")
+
+    a_single = bytes(await tb.mem_read(G.MEM_A_BASE, n * n))
+    b_single = bytes(await tb.mem_read(G.MEM_B_BASE, n * n))
+    assert a_single == a_burst, (
+        f"REQ-119: mem_a differs between {bursts_per_operand} maximal "
+        f"burst(s) and {dw_per_operand} single-DWORD writes\n"
+        f"  burst : {a_burst.hex()}\n  single: {a_single.hex()}")
+    assert b_single == b_burst, (
+        f"REQ-119: mem_b differs between {bursts_per_operand} maximal "
+        f"burst(s) and {dw_per_operand} single-DWORD writes\n"
+        f"  burst : {b_burst.hex()}\n  single: {b_single.hex()}")
 
     await run_op(tb)
-    c_bytes = await read_c(tb, n)
+    c_single = await read_c(tb, n)
     assert_matrix_equal(
-        c_bytes, exp, "C after byte-by-byte written operands",
-        extra=f"  REQ-119: {2 * n * n} single-DWORD byte-enabled writes must "
-              "produce the same result as one burst per operand.")
+        c_single, exp, "C after single-DWORD written operands",
+        extra=f"  REQ-119: {2 * dw_per_operand} single-DWORD writes must "
+              f"produce the same result as {2 * bursts_per_operand} maximal "
+              "burst(s).")
+    assert c_single == c_burst, (
+        "REQ-119: C differs between the burst-written and the "
+        "single-DWORD-written load of identical data")
 
 
-@cocotb.test(timeout_time=1200, timeout_unit="us")
+@cocotb.test(timeout_time=1500, timeout_unit="us")
 async def test_matmul_read_granularity_equivalence(dut):
-    """REQ-120: C read as bursts and as single DWORDs returns identical data."""
+    """REQ-120 (reworded in spec v1.1.0).
+
+    Reading the whole of C with the minimum number of maximal bursts,
+    `ceil(N*N/32)` MRd TLPs of up to 32 DWORDs each, must return byte-for-byte
+    the same data as `N*N` single-DW MRds.  Both sides cover all `4*N*N`
+    bytes of C -- the v1.0.0 wording compared one 32-DW burst (half of C at
+    N=8) against 64 single-DW reads (all of C).
+    """
     tb = await make_tb(dut)
     n = await discover_n(tb)
     rng = random.Random(tb.seed ^ 0xDECAF)
@@ -440,17 +513,46 @@ async def test_matmul_read_granularity_equivalence(dut):
     await load_ab(tb, a, b, n)
     await run_op(tb)
 
-    burst = await tb.mem_read(G.MEM_C_BASE, 4 * n * n)
-    assert bytes(burst) == G.c_to_bytes(exp, n), (
-        "REQ-120: the burst read of C does not match the golden model")
+    total_dw = n * n
+    exp_bursts = ceil_div(total_dw, MAX_BURST_DW)
 
+    # --- (1) ceil(N*N/32) maximal bursts, counted ------------------------
+    before = tb.shim.rx_packets
+    burst = bytearray()
+    off = 0
+    while off < total_dw:
+        ndw = min(MAX_BURST_DW, total_dw - off)
+        req, cpl = await mrd(tb, G.MEM_C_BASE + 4 * off, length=ndw,
+                             first_be=0xF, last_be=0xF if ndw > 1 else 0)
+        assert cpl.status == 0, (
+            f"REQ-120: burst read of C at DWORD {off} returned status "
+            f"{cpl.status!r}, expected SC")
+        assert cpl.length == ndw, (
+            f"REQ-028: completion Length {cpl.length} != request {ndw}")
+        burst += cpl.get_data()
+        off += ndw
+    framed = tb.shim.rx_packets - before
+    assert framed == exp_bursts, (
+        f"REQ-120: {framed} MRd TLPs were used to read all of C; the minimum "
+        f"number of maximal (32 DW) bursts is ceil(N*N/32) = {exp_bursts}")
+    assert bytes(burst) == G.c_to_bytes(exp, n), (
+        "REQ-120/REQ-105: the burst read of C does not match the golden model")
+
+    # --- (2) N*N single-DWORD reads --------------------------------------
+    before = tb.shim.rx_packets
     single = bytearray()
-    for m in range(n * n):
-        val = await mrd_dword(tb, G.MEM_C_BASE + 4 * m)
-        single += int(val).to_bytes(4, "little")
+    for m in range(total_dw):
+        single += int(await mrd_dword(tb, G.MEM_C_BASE + 4 * m)
+                      ).to_bytes(4, "little")
+    framed = tb.shim.rx_packets - before
+    assert framed == total_dw, (
+        f"internal: {framed} single-DWORD MRds were framed, expected "
+        f"{total_dw}")
     assert bytes(single) == bytes(burst), (
-        f"REQ-120: reading C as {n * n} single-DWORD MRds returned different "
-        "data from reading it as bursts")
+        f"REQ-120: reading all {4 * total_dw} bytes of C as {total_dw} "
+        f"single-DWORD MRds returned different data from reading it as "
+        f"{exp_bursts} maximal burst(s)\n  burst : {bytes(burst).hex()}\n"
+        f"  single: {bytes(single).hex()}")
 
 
 @cocotb.test(timeout_time=400, timeout_unit="us")
@@ -482,3 +584,150 @@ async def test_matmul_soft_reset_during_operation(dut):
                         "C after an aborted operation and a clean re-run",
                         extra="  REQ-095: START must clear every PE "
                               "accumulator.")
+
+
+async def _wait_until_cycle(dut, target, limit=4000):
+    """Spin on the clock until `cycle_now()` reaches `target`."""
+    for _ in range(limit):
+        if cycle_now() >= target:
+            return
+        await RisingEdge(dut.clk)
+    raise TbTimeout(
+        f"never reached cycle {target} (now {cycle_now()}) while waiting on "
+        "dut.clk")
+
+
+@cocotb.test(timeout_time=3000, timeout_unit="us")
+async def test_matmul_soft_reset_during_drain(dut):
+    """REQ-125 (new in spec v1.1.0): SOFT_RESET during DRAIN.
+
+    The drain is aborted immediately.  Words of `mem_c` already written by the
+    drain keep their new values; words not yet reached keep their prior
+    values.  The result is *defined but mixed*, so the check is "every word is
+    one or the other, never something else" -- not a single expected array.
+
+    REQ-098 additionally fixes the drain order: on drain cycle `m` the bottom
+    row output carries `acc(N-1-m, j)`, so C is written row `N-1` first.  A
+    partially drained C must therefore have its **new** rows forming a
+    contiguous suffix `{N-1, N-2, ...}`; anything else means rows were drained
+    in the wrong order or a row was half-written.
+
+    The SOFT_RESET is swept across the whole drain window because the exact
+    cycle the drain starts is internal.  Spec 9.6 (v1.1.1) fixes
+    `t_start = t_beat`, so the sweep is aimed directly in beat cycles.
+    """
+    tb = await make_tb(dut)
+    n = await discover_n(tb)
+
+    # Pre-operation pattern: large values that no legal product can equal
+    # (|C| <= N * 16384 = 131072 for every legal N), so "old" and "new" are
+    # never ambiguous.
+    old = [[0x40000000 + i * n + j for j in range(n)] for i in range(n)]
+    old_bytes = G.c_to_bytes(old, n)
+
+    rng = random.Random(tb.seed ^ 0xD3A12)
+    a = [[rng.randint(-128, 127) or 1 for _ in range(n)] for _ in range(n)]
+    b = [[rng.randint(-128, 127) or 1 for _ in range(n)] for _ in range(n)]
+    new = G.matmul_golden(a, b, n)
+    await load_ab(tb, a, b, n)
+
+    # PRIME + FETCH + COMPUTE + TURN = 1 + 1 + (3N-2) + 1 = 3N+1 cycles, so
+    # DRAIN runs over t_start + 3N+1 .. t_start + 4N.  Sweep a little wider.
+    lo, hi = 3 * n - 1, 4 * n + 3
+    profile = []
+
+    for offset in range(lo, hi + 1):
+        await tb.mem_write(G.MEM_C_BASE, old_bytes)
+        await mwr_dword(tb, G.REG_STATUS, G.ST_W1C_MASK)
+        back = bytes(await tb.mem_read(G.MEM_C_BASE, 4 * n * n))
+        assert back == old_bytes, (
+            "REQ-090: the pre-operation C pattern did not stick")
+
+        start = tb.make_mem_write(tb.bar0_addr + G.REG_CTRL,
+                                  G.CTRL_START.to_bytes(4, "little"))
+        srst = tb.make_mem_write(
+            tb.bar0_addr + G.REG_CTRL,
+            G.CTRL_SOFT_RESET.to_bytes(4, "little"))
+
+        cap = tb.shim.start_capture()
+        try:
+            t_start_beat = await inject_and_get_beat(tb, start, payload_index=0)
+            # Aim the SOFT_RESET payload beat at t_start + offset.  Spec 9.6
+            # gives t_start = t_beat, so the offset is a plain beat-to-beat
+            # distance.  The TLP is 4 beats long, so start driving it 4
+            # cycles early.
+            await _wait_until_cycle(dut, t_start_beat + offset - 4)
+            t_srst_beat = await inject_and_get_beat(tb, srst, payload_index=0)
+        finally:
+            tb.shim.stop_capture()
+
+        landed = t_srst_beat - t_start_beat
+        await tb.settle()
+
+        st = await tb.read_dword(G.REG_STATUS)
+        assert st == 0, (
+            f"REQ-071: STATUS = 0x{st:08x} after a SOFT_RESET aimed at drain "
+            f"offset {offset} (landed at +{landed}); BUSY, DONE and every "
+            "error bit must be clear")
+
+        got = G.bytes_to_c(await tb.mem_read(G.MEM_C_BASE, 4 * n * n), n)
+
+        undefined = []
+        row_state = []
+        for i in range(n):
+            kinds = set()
+            for j in range(n):
+                if got[i][j] == new[i][j]:
+                    kinds.add("new")
+                elif got[i][j] == old[i][j]:
+                    kinds.add("old")
+                else:
+                    undefined.append((i, j, got[i][j]))
+            row_state.append(kinds)
+
+        assert not undefined, (
+            f"REQ-125: with the SOFT_RESET beat landing {landed} cycles "
+            f"after the CTRL.START beat, {len(undefined)} word(s) of mem_c "
+            "hold neither their pre-operation value nor their correct new "
+            "value.  Spec 10.3 requires mem_c to be left in a *defined but "
+            "mixed* state.  First offenders (i, j, value): "
+            + ", ".join(f"({i},{j},{v})" for i, j, v in undefined[:6]))
+
+        new_rows = [i for i in range(n) if "new" in row_state[i]]
+        mixed_rows = [i for i in range(n) if len(row_state[i]) > 1]
+        assert not mixed_rows, (
+            f"REQ-098/REQ-125: rows {mixed_rows} of mem_c are part old and "
+            f"part new after a SOFT_RESET at +{landed}.  The drain writes one "
+            "complete row of C per cycle (REQ-089), so a row is either fully "
+            "written or not written at all")
+        if new_rows:
+            expected_suffix = list(range(n - len(new_rows), n))
+            assert new_rows == expected_suffix, (
+                f"REQ-098/REQ-125: the drained rows are {new_rows} after a "
+                f"SOFT_RESET at +{landed}; REQ-098 drains row N-1 first, so "
+                f"the new rows must be the contiguous suffix "
+                f"{expected_suffix}")
+        profile.append((offset, landed, len(new_rows)))
+
+    dut._log.info("REQ-125 drain-abort profile (aimed offset, landed, rows "
+                  "drained): %s", profile)
+
+    counts = sorted({rows for _, _, rows in profile})
+    assert len(counts) > 1, (
+        f"REQ-125: every SOFT_RESET in the sweep [{lo}, {hi}] left the same "
+        f"{counts[0]} of {n} rows drained, so the sweep never actually landed "
+        "inside DRAIN and the requirement was not exercised.  Widen the "
+        "sweep or re-derive the drain window from spec 12.5.")
+    assert any(0 < rows < n for _, _, rows in profile), (
+        f"REQ-125: no SOFT_RESET in the sweep produced a partially drained C "
+        f"(row counts seen: {counts}); the mid-DRAIN abort path was never "
+        "exercised")
+
+    # After all that, the device must still compute correctly.
+    await run_op(tb)
+    got = await read_c(tb, n)
+    assert_matrix_equal(got, new,
+                        "C after re-running the operation following a "
+                        "mid-drain SOFT_RESET",
+                        extra="  REQ-125: software must re-run the operation; "
+                              "the re-run must produce the exact product.")

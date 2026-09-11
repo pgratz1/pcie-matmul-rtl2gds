@@ -38,7 +38,11 @@ module pcie_cfg_space (
     input  logic         req_write,
     input  logic [9:0]   req_dw_addr,
     input  logic [3:0]   req_be,
+    // req_wdata[13:8] lands on Command[15:8] and BAR0[13:8], both RO 0, so those
+    // bits are deliberately dropped.
+    // verilator lint_off UNUSEDSIGNAL
     input  logic [31:0]  req_wdata,
+    // verilator lint_on UNUSEDSIGNAL
     input  logic [15:0]  req_completer_id,
     output logic [31:0]  rdata,
 
@@ -103,11 +107,6 @@ module pcie_cfg_space (
             end
         end
     end
-
-    // req_wdata[13:8] land on Command[15:8] and BAR0[13:8], both RO 0, so they
-    // are deliberately dropped. Explicit sink so the linter sees that.
-    logic unused_wdata;
-    assign unused_wdata = |req_wdata[13:8];
 
     always_comb begin
         case (req_dw_addr)

@@ -1,6 +1,6 @@
 # PCIe-Attached Matrix Multiplier — Architecture and Micro-Architecture Specification
 
-**Spec version: 1.0.0**
+**Spec version: 1.1.2**
 **Date: 2026-09-10**
 **Owner: spec-writer**
 **Status: Phase 1 deliverable. Binding on rtl-designer, test-writer, rtl-reviewer, circuit-designer.**
@@ -17,6 +17,37 @@ Change log:
 | Version | Date | Change | REQ IDs affected |
 |---------|------|--------|------------------|
 | 1.0.0 | 2026-09-10 | Initial issue. | all (REQ-001 … REQ-121) |
+| 1.1.0 | 2026-09-10 | Amendment batch from Phase 2 (rtl-designer, test-writer) and the Phase 2b review. 11 items; no requirement was renumbered or repurposed. | **Reworded:** REQ-071, REQ-080, REQ-119, REQ-120. **Added:** REQ-122 … REQ-125. **Informative notes only, meaning unchanged:** REQ-012, REQ-021, REQ-041, REQ-077, REQ-101. |
+
+| 1.1.1 | 2026-09-10 | Fixed an internal inconsistency in the definition of `t_start`, and the REQ-123 off-by-one it caused. §9.6 now names `t_beat`, `t_start` and `t_commit` separately and fixes `t_start = t_beat`. `D_WR` is deliberately excluded from every latency formula. No RTL change required. | **Corrected:** REQ-123 (`t_beat + 4*N + 2`, was `t_beat + D_WR + 4*N + 2`). **Clarified, meaning unchanged:** REQ-074, REQ-101, REQ-122. |
+
+| 1.1.2 | 2026-09-10 | REQ-119's v1.1.0 repair was still unsatisfiable at `N`=16 and `N`=32 (one operand is 64 and 256 DW, over the 32-DW burst cap); burst count is now `ceil(ceil(N*N/4)/32)`. REQ-120 re-checked and confirmed correct for all legal `N`. Added REQ-126 for malformed-`Length` configuration requests. | **Corrected:** REQ-119. **Added:** REQ-126. **Re-confirmed, unchanged:** REQ-120. |
+
+### What changed in v1.1.0, and what the test writer must re-check
+
+**Meaning changed — re-check these four tests:**
+
+| ID | Change |
+|----|--------|
+| REQ-071 | The `mem_c` clause is narrowed. `SOFT_RESET` no longer claims to leave `mem_c` "unchanged"; it claims only that it does not itself modify `mem_c`. The reachable guarantee moved to the new REQ-125. |
+| REQ-080 | Was "`irq` is 1 **iff** `IRQ_STATUS != 0`", which contradicted REQ-012's *registered* output. Now "tracks within 2 clock cycles in both directions". REQ-012 is unchanged. |
+| REQ-119 | Was arithmetically impossible (one 32-DW burst cannot span A at `0x1000` and B at `0x2000`, and A+B is 32 DW not 64). Now: one maximal burst per operand versus `2*ceil(N*N/4)` single-DW writes. |
+| REQ-120 | Was arithmetically impossible (C is 64 DW at `N=8`, so one 32-DW burst covers half of it while the 64 single-DW reads covered all of it). Now: `ceil(N*N/32)` maximal bursts versus `N*N` single-DW reads, both covering all of C. |
+
+**Added — four new tests needed:** REQ-122, REQ-123 (§9.6, the `D_WR` write-path
+constant and the pin-observable form of the `4N+2` latency), REQ-124, REQ-125
+(§10.3, `START`+`SOFT_RESET` together while busy, and `SOFT_RESET` mid-`DRAIN`).
+
+**Unchanged in meaning, but read the new notes:** REQ-012 (kept as-is; REQ-080 moved
+instead), REQ-021 (still a bound; §9.6 now closes the observability gap), REQ-041
+(Message clause is unreachable with this host model — documented limitation, not a
+coverage hole), REQ-077 (three of its four collisions are structurally unreachable),
+REQ-101 (unchanged; REQ-123 is its boundary-observable restatement).
+
+**Non-requirement corrections:** §12.5 `PRIME`/`FETCH` (operand read indices are
+issued in `FETCH`, not `PRIME` — issuing in `PRIME` would double-count the `k=0`
+product); §7.3 (`app_rdata_last` removed from the interface table); §4.3 (`IOWr`
+treated as posted — recorded as a deliberate v1 simplification, DEC-013).
 
 ---
 
@@ -213,7 +244,20 @@ assignment, and the whole application layer. Only layers 1 and 2 are modeled.
 | TLP class | Examples | DUT behaviour |
 |-----------|----------|---------------|
 | Non-posted, unsupported | `MRd64` (Fmt `001`), `MRdLk`, `IORd`, `CfgRd1`/`CfgWr1` (Type `00101`), `FetchAdd`, `Swap`, `CAS` | Return `Cpl` with status **UR**; set `STATUS.ERR_UNSUP_REQ`. |
-| Posted, unsupported | `MWr64` (Fmt `011`), `IOWr`, any Message (`Msg`/`MsgD`) | Discard; set `STATUS.ERR_UNSUP_REQ`. No Completion (posted requests get none). |
+| Posted, unsupported | `MWr64` (Fmt `011`), `IOWr` (see note), any Message (`Msg`/`MsgD`) | Discard; set `STATUS.ERR_UNSUP_REQ`. No Completion (posted requests get none). |
+
+> **Deliberate deviation — `IOWr` is treated as posted.** PCIe Base r6.0 §2.2.7 and
+> Table 2-2 classify I/O Write as a **non-posted** request, so a fully compliant
+> completer would answer an unsupported `IOWr` with a UR Completion rather than
+> discarding it silently. This design discards it, i.e. it handles `IOWr` on the
+> posted path. This is **accepted as a v1 simplification, not a defect.** Rationale:
+> BAR0 is the only BAR and it is a memory BAR, the configuration space declares no
+> I/O BARs at all (all of BAR1–BAR5 read 0 and `Command.IOSE` has no effect), so a
+> conforming root complex will never route an I/O request to this device; the only
+> source of one is a deliberately malformed test stimulus. Handling it on the posted
+> path saves a decode case in `tlp_rx` and loses nothing a real host would notice.
+> Recorded as DEC-013. If strict compliance is ever wanted, move `IOWr` to the
+> non-posted row above and it acquires a UR Completion with no other change.
 | Completions arriving inbound | `Cpl`, `CplD` | Discard silently. The DUT is never a requester, so a Completion arriving is a host-model error, not a DUT error. Do **not** set an error bit and do **not** return a Completion (PCIe Base r6.0 §2.3.2: a Completion never generates a Completion). |
 | Any TLP with `TD` = 1 (TLP digest present) | | Treated as unsupported: same as the two rows above according to posted/non-posted. |
 | Any TLP with `EP` = 1 (poisoned) | | Same as `TD` = 1. |
@@ -496,6 +540,7 @@ independent layout.
 
 ```
  DW0 : as §7.2.1, Fmt=000 (CfgRd0) or 010 (CfgWr0), Type=00100, Length=1
+       (Length MUST be 1; any other value is malformed -- see REQ-126)
 
  DW1 : 31 ................. 16 | 15 ......... 8 | 7 6 5 4 | 3 2 1 0
        +-----------------------+----------------+---------+---------+
@@ -553,7 +598,13 @@ Toward `app_bar0`:
 | `app_req_first_be` | out | 4 | First DW Byte Enables. |
 | `app_req_last_be` | out | 4 | Last DW Byte Enables (0 when `len` == 1). |
 | `app_wdata_valid`/`ready`/`data`/`last` | out/in/out/out | 1/1/32/1 | Write payload stream, `len` beats, little-endian mapping. |
-| `app_rdata_valid`/`ready`/`data`/`last` | in/out/in/in | 1/1/32/1 | Read data stream, `len` beats. |
+| `app_rdata_valid`/`ready`/`data` | in/out/in | 1/1/32 | Read data stream, `len` beats. |
+
+There is deliberately **no `app_rdata_last`**. `tlp_tx` already knows how many payload
+DWORDs a Completion carries, because it builds the `Length` field itself from the
+request; a last-beat marker on the read path would be redundant information that could
+disagree with `Length`. (v1.0.0 listed `app_rdata_last`; it was removed in v1.1.0 after
+Phase 2b found it driven and sunk but never consumed.)
 
 Requirements:
 
@@ -576,7 +627,10 @@ Requirements:
   in ascending address order, exactly `Length` of them.
 
 **Latency.** Header DW0 accepted at cycle `t` and DW2 at cycle `t+2` (no stalls) ->
-`app_req_valid` at cycle `t+3` at the latest.
+`app_req_valid` at cycle `t+3` at the latest. This is a bound, not an exact figure,
+so the internal request latency is not by itself enough to make REQ-101's `4N+2`
+observable from the chip pins. §9.6's `D_WR` constant closes that gap; see REQ-122
+and REQ-123.
 
 ### 7.4 Submodule: `tlp_tx`
 
@@ -660,6 +714,18 @@ Definitions used below, matching `cocotbext-pcie` bit-for-bit:
   shall be answered with a UR Completion and shall set `STATUS.ERR_UNSUP_REQ`.
 - **REQ-041** Any inbound TLP of a type listed in §4.3 as "posted, unsupported" shall
   be discarded and shall set `STATUS.ERR_UNSUP_REQ`. No Completion is emitted.
+
+> **Verification limitation on REQ-041's Message clause (v1.1.0, informative — does
+> not change REQ-041).** `cocotbext-pcie` 0.2.16 cannot encode Message TLPs:
+> `Tlp.pack_header()` raises `Exception("Unknown TLP type")` for every `MSG_*`
+> fmt/type, so the shim physically cannot put a Message on `rx_tlp_*`. The Message
+> clause of REQ-041 is therefore **unreachable by construction in this testbench**,
+> not merely untested. It is covered indirectly: `MWr64` and `IOWr` exercise the same
+> discard-and-flag path through `tlp_rx`, and they are the only posted-unsupported
+> types a real host would ever send here. This is a documented environment limitation,
+> **not a coverage hole**; the requirement stays in the spec because the RTL must
+> still not mis-frame a Message if one ever arrives. Do not remove or weaken REQ-041
+> to close a coverage report.
 - **REQ-042** A `CfgRd0`/`CfgWr0` whose Device Number or Function Number is non-zero
   shall be answered with a UR Completion and shall **not** set
   `STATUS.ERR_UNSUP_REQ` (this happens on every bus scan and is not an error).
@@ -668,6 +734,19 @@ Definitions used below, matching `cocotbext-pcie` bit-for-bit:
 - **REQ-044** An `MRd` or `MWr` that would cross the end of the BAR0 window
   (`offset + Length*4 > 16384`) shall be treated as not matching BAR0 (REQ-038 /
   REQ-039).
+- **REQ-126** *(new in v1.1.2.)* A `CfgRd0` or `CfgWr0` whose `Length` field is not
+  exactly 1 is malformed (§7.2.3; PCIe Base r6.0 §2.2.7 fixes Configuration Requests
+  at one DWORD). The DUT shall:
+  (a) answer it with a `Cpl` carrying UR status, formatted per REQ-035 — at
+  `cfg_completer_id` = `0x0000` this is `DW0 = 0x0A000000`, `DW1 = 0x00002004`,
+  `DW2` per §7.2.4, three beats total;
+  (b) modify no configuration register;
+  (c) for a `CfgWr0`, consume and discard all surplus payload DWORDs through
+  `rx_tlp_eop`, so that framing is preserved and the next TLP is parsed correctly; and
+  (d) set `STATUS.ERR_UNSUP_REQ`.
+  This applies regardless of Device and Function number; the REQ-042 carve-out, which
+  exists only because routine bus scans probe absent devices, does **not** extend to a
+  malformed `Length`.
 
 ---
 
@@ -849,11 +928,61 @@ No field layout is restated here; §7.2 is the only authority.
 - **REQ-064** Register reads and register writes (region `0x0000`–`0x0FFF`) are
   permitted at all times, including while `STATUS.BUSY == 1`.
 
-### 9.6 Latency contract
+### 9.6 Latency contract, and the `D_WR` write-path constant
 
 - Read: `app_req_valid` accepted at cycle `t` -> first read DWORD available at cycle
   `t+2`, then one DWORD per cycle.
-- Write: payload DWORD accepted at cycle `t` -> storage updated at cycle `t+1`.
+- Write: payload DWORD accepted by `app_bar0` at cycle `t` -> the new value is
+  readable from cycle `t + D_WR` onward (`t_commit`), with `D_WR` as defined below.
+  The write is *taken* at cycle `t`; it becomes *visible* at `t + D_WR`.
+
+**Three cycles, named once, never conflated.** v1.1.0 used "accepted" and "updated"
+loosely and ended up with two incompatible readings of `t_start`. The following three
+names are now the only ones used anywhere in this specification:
+
+| Name | Definition |
+|------|------------|
+| `t_beat` | The cycle on which the payload DWORD of a BAR0 write transfers on `rx_tlp_*`, i.e. `rx_tlp_valid` and `rx_tlp_ready` are both 1 for that beat. Externally observable. |
+| `t_start` | **Identical to `t_beat`** for a write that carries `CTRL.START`. This is the cycle REQ-074 and REQ-101 measure `4*N + 2` from. "Accepted by `reg_file`" in REQ-074 means *this* cycle — the cycle the write is taken in, **not** the cycle its effect becomes readable. |
+| `t_commit` | The cycle on which the addressed register or storage location holds the new value, i.e. the first cycle a read would return it. `t_commit = t_beat + D_WR`. |
+
+**Definition — `D_WR` = `t_commit - t_beat`.** `D_WR` is a property of the
+implementation's write path, not a free parameter of each access. Its measured value
+in the v1 RTL is **1**.
+
+`D_WR` describes when a write becomes *visible*. It is deliberately **not** a term in
+any operation-latency formula: REQ-074, REQ-101 and REQ-123 all measure from `t_beat`,
+so adding `D_WR` to them would double-count the write path. That double-count was the
+v1.1.0 defect.
+
+- **REQ-122** *(new in v1.1.0.)* `D_WR` shall be a single fixed constant of the
+  implementation: identical for every BAR0 write regardless of target region
+  (`reg_file`, `mem_a`, `mem_b`, `mem_c`), regardless of the DWORD's position within
+  a burst, regardless of Byte Enables, and independent of `N`. Its value shall lie in
+  the range 1 to 3 inclusive. It may be measured once at the chip boundary — write
+  `SCRATCH`, then read it back on successive cycles — and reused for every other
+  timing check.
+- **REQ-123** *(new in v1.1.0; corrected in v1.1.1.)* Given a `CTRL` write whose
+  payload DWORD has bit 0 (`START`) set and transfers on `rx_tlp_*` at cycle `t_beat`,
+  and given that `STATUS.BUSY` was 0 at `t_beat`, `STATUS.DONE` shall be set at
+  exactly cycle `t_beat + 4*N + 2`, provided neither `rx_tlp_*` nor `tx_tlp_*` stalls
+  in that interval. This is the boundary-observable form of REQ-101: `t_start` is
+  `t_beat`, so the two state the same thing and must agree. `PERF_CYCLES` (REQ-102)
+  must independently read `4*N + 2`. At `N = 8`, `DONE` is set at `t_beat + 34`.
+
+> **Why this was added, and why it was wrong in v1.1.0.** Phase 2b observed that §7.3
+> states the internal request latency as an upper bound ("at the latest"), so
+> REQ-101's exact `4N+2` could only be checked through `PERF_CYCLES`, never by
+> watching the pins. v1.1.0 introduced `D_WR` to close that gap but wrote REQ-123 as
+> `t_beat + D_WR + 4*N + 2`, which double-counted the write path: REQ-074 already
+> measures `4N+2` from the cycle the write is *taken* (`t_beat`), not the cycle it
+> becomes *visible* (`t_beat + D_WR`). The real defect was that §9.6 and REQ-074 could
+> be read as placing `t_start` one cycle apart; the off-by-one was only its symptom.
+> v1.1.1 names `t_beat`, `t_start` and `t_commit` separately above, fixes `t_start =
+> t_beat`, and keeps `D_WR` out of every latency formula. `D_WR` survives only as the
+> write-visibility invariant of REQ-122, which the RTL meets with `D_WR = 1`.
+> **No RTL change is required:** the v1 RTL sets `DONE` at `t_beat + 4N + 2` = 34 at
+> `N = 8`, which is what REQ-123 now demands.
 
 ---
 
@@ -903,16 +1032,40 @@ reset values.
   cleared, and all `mm_pe` accumulators are cleared to 0.
 - **REQ-070** Writing 1 to `CTRL.START` while `STATUS.BUSY == 1` shall have no effect
   on the running operation and shall set `STATUS.ERR_START_BUSY`.
-- **REQ-071** Writing 1 to `CTRL.SOFT_RESET` shall, within 2 clock cycles: return
-  `mm_ctrl` to IDLE, clear `STATUS.BUSY`, `STATUS.DONE` and all `STATUS` error bits,
-  clear `PERF_CYCLES` to 0, and clear all `mm_pe` accumulators to 0. It shall leave
-  `mem_a`, `mem_b`, `mem_c`, `SCRATCH`, `IRQ_ENABLE`, `OP_COUNT` and the entire
-  configuration space (including BAR0) unchanged.
+- **REQ-071** *(clause on `mem_c` narrowed in v1.1.0 — see REQ-125.)* Writing 1 to
+  `CTRL.SOFT_RESET` shall, within 2 clock cycles: return `mm_ctrl` to IDLE, clear
+  `STATUS.BUSY`, `STATUS.DONE` and all `STATUS` error bits, clear `PERF_CYCLES` to 0,
+  and clear all `mm_pe` accumulators to 0. It shall leave `mem_a`, `mem_b`, `SCRATCH`,
+  `IRQ_ENABLE`, `OP_COUNT` and the entire configuration space (including BAR0)
+  unchanged. It shall not itself modify any word of `mem_c`; what `mem_c` contains
+  afterwards is governed by REQ-125.
 - **REQ-072** If `START` and `SOFT_RESET` are written 1 in the same DWORD write,
-  `SOFT_RESET` takes precedence and no operation is started.
+  `SOFT_RESET` takes precedence and no operation is started. See REQ-124 for the case
+  where this happens while `STATUS.BUSY == 1`.
 - **REQ-073** A `CTRL` write shall take effect only for bytes whose Byte Enable is 1;
   `CTRL.START` and `CTRL.SOFT_RESET` are in byte 0, so `First BE[0]` must be 1 for
   them to act.
+- **REQ-124** *(new in v1.1.0.)* If `START` and `SOFT_RESET` are both written 1 in the
+  same DWORD **while `STATUS.BUSY == 1`**, `SOFT_RESET` shall take effect in full per
+  REQ-071, the `START` shall be ignored entirely, and `STATUS.ERR_START_BUSY` shall
+  **not** be left set. (Whether the RTL suppresses the error at the source or sets it
+  and has REQ-071's clear override it in the same cycle is not observable and is not
+  constrained; the observable requirement is that `STATUS.ERR_START_BUSY` reads 0
+  afterwards.)
+- **REQ-125** *(new in v1.1.0.)* `CTRL.SOFT_RESET` asserted while `mm_ctrl` is in the
+  `DRAIN` state shall abort the drain immediately. Words of `mem_c` already written by
+  the drain retain their newly written values; words not yet reached retain whatever
+  they held before the operation. `mem_c` is therefore left in a **defined but mixed**
+  state: every word holds either its pre-operation value or its correct new value, and
+  no word holds an otherwise-undefined value. Software must treat C as invalid after a
+  mid-operation `SOFT_RESET` and must re-run the operation.
+
+> **Why REQ-125 exists.** v1.0.0's REQ-071 said `SOFT_RESET` "leaves `mem_c`
+> unchanged". That is unmappable to hardware if `SOFT_RESET` lands mid-`DRAIN`: the
+> rows the drain has already committed are already written, and unwinding them would
+> require shadow storage that this design deliberately does not have. REQ-071's
+> `mem_c` clause has been narrowed to "`SOFT_RESET` does not itself modify `mem_c`",
+> and REQ-125 now states the guarantee that is actually achievable and testable.
 
 ### 10.4 `STATUS` (0x0010)
 
@@ -925,17 +1078,33 @@ reset values.
 | 4 | `ERR_UNSUP_REQ` | W1C | unsupported request (§7.6) | writing 1, or `SOFT_RESET`, or `rst` |
 | 31:5 | — | RO 0 | | |
 
-- **REQ-074** Let `t_start` be the cycle on which the `CTRL.START` write DWORD is
-  accepted by `reg_file`, and `t_done = t_start + 4*N + 2` the cycle on which
-  `STATUS.DONE` is set. `STATUS.BUSY` shall read 1 on every cycle in the closed
-  interval `[t_start + 1, t_done]` and 0 on every cycle outside it.
+- **REQ-074** *(`t_start` pinned in v1.1.1; the requirement itself is unchanged.)* Let
+  `t_start` be the cycle on which the `CTRL.START` write DWORD is **taken** by
+  `reg_file` — which is `t_beat`, the cycle that write's payload DWORD transfers on
+  `rx_tlp_*`, and **not** `t_commit = t_beat + D_WR`; see §9.6. Let
+  `t_done = t_start + 4*N + 2` be the cycle on which `STATUS.DONE` is set.
+  `STATUS.BUSY` shall read 1 on every cycle in the closed interval
+  `[t_start + 1, t_done]` and 0 on every cycle outside it.
 - **REQ-075** `STATUS.DONE` shall be set on the cycle the operation completes and
   shall remain set until written with 1, `SOFT_RESET`, or `rst`.
 - **REQ-076** Each W1C bit shall be cleared when a `STATUS` write is performed with
   that bit position = 1 **and** the Byte Enable covering that bit = 1. Writing 0 to a
   W1C bit shall leave it unchanged.
 - **REQ-077** If a W1C bit's set condition and a clearing write occur on the same
-  clock edge, the **set** wins (the bit remains 1).
+  clock edge, the **set** wins (the bit remains 1). This priority shall hold for all
+  four W1C bits uniformly.
+
+> **Reachability note (v1.1.0, informative — does not change REQ-077).** Of the four
+> set-versus-clear collisions REQ-077 covers, only `DONE` is actually reachable in
+> this design. `ERR_UNSUP_REQ` is set from `tlp_rx`'s header-parse state while a
+> register write requires `tlp_rx` to be in its write-payload state, and the two
+> states are mutually exclusive. `ERR_START_BUSY` and `ERR_WRITE_BUSY` each require a
+> *different beat of the same burst* to be in flight simultaneously, which the
+> one-DWORD-per-cycle sequencing of REQ-056 forbids. REQ-077 is still stated
+> uniformly, because the priority must be designed in rather than depend on those
+> arguments remaining true, and because they would stop being true if DEC-007's
+> strict serialization were ever relaxed. Test-writer: do not treat the three
+> unreachable collisions as a coverage hole.
 - **REQ-078** `STATUS` bits 31:5 shall read 0 and ignore writes.
 
 ### 10.5 `IRQ_ENABLE` (0x0014) and `IRQ_STATUS` (0x0018)
@@ -953,9 +1122,21 @@ reset values.
 
 - **REQ-079** `IRQ_STATUS` (0x0018) shall read `STATUS & IRQ_ENABLE`, evaluated
   bitwise, at all times. It is RO; writes are ignored.
-- **REQ-080** `irq` (top-level output) shall be 1 if and only if `IRQ_STATUS != 0`.
-  `irq` is a registered, level-sensitive, active-high output. There is no edge or
-  pulse behaviour and no MSI (DEC-008).
+- **REQ-080** *(reworded in v1.1.0 to remove a contradiction with REQ-012.)* `irq`
+  (top-level output) shall track `IRQ_STATUS != 0` **within 2 clock cycles** in both
+  directions: it shall assert within 2 cycles of `IRQ_STATUS` becoming non-zero and
+  deassert within 2 cycles of `IRQ_STATUS` becoming zero. `irq` is a registered,
+  level-sensitive, active-high output. There is no edge or pulse behaviour and no MSI
+  (DEC-008).
+
+> **Why this was reworded.** v1.0.0 had REQ-012 requiring a *registered* `irq` and
+> REQ-080 requiring `irq` high *if and only if* `IRQ_STATUS != 0`. A registered output
+> necessarily lags its input by at least one cycle, so the two could not both hold
+> exactly; the rtl-designer and the rtl-reviewer reached that conclusion
+> independently. REQ-012 (registered) is kept, because an unregistered `irq` would
+> expose a combinational path from the register file straight to a chip output.
+> REQ-080 now states a 2-cycle tracking window, consistent with REQ-081, which
+> already allowed 2 cycles for deassertion. **REQ-012 is unchanged.**
 - **REQ-081** Clearing the responsible `STATUS` bit (W1C) or clearing the
   corresponding `IRQ_ENABLE` bit shall deassert `irq` within 2 clock cycles, provided
   no other enabled status bit is set.
@@ -1126,8 +1307,8 @@ State machine:
 | State | Entered when | Duration | Action |
 |-------|--------------|----------|--------|
 | `IDLE` | reset, `SOFT_RESET`, or after `DONE` | — | `busy = 0`. Waits for `start`. |
-| `PRIME` | `start` accepted | 1 cycle | Clear all accumulators; issue the first `mem_a`/`mem_b` read indices. |
-| `FETCH` | after `PRIME` | 1 cycle | Absorb the 1-cycle `mem_a`/`mem_b` read latency; first operands arrive at the array edge. |
+| `PRIME` | `start` accepted | 1 cycle | Clear all accumulators (`clr_acc` asserted in this state and only in this state). **No `mem_a`/`mem_b` read index is issued in `PRIME`.** |
+| `FETCH` | after `PRIME` | 1 cycle | Issue the `k = 0` `mem_a`/`mem_b` read indices, and absorb the 1-cycle read latency, so that the first operands arrive at the array edge on the first cycle of `COMPUTE`. |
 | `COMPUTE` | after `FETCH` | `3N-2` cycles | Feed schedule of §12.4. |
 | `TURN` | after `COMPUTE` | 1 cycle | Switch the array from accumulate to shift. |
 | `DRAIN` | after `TURN` | `N` cycles | Shift accumulators south, write `mem_c` rows. |
@@ -1139,6 +1320,14 @@ Cycle count for one `N x N` multiply:
   T_mm(N) = 1 (PRIME) + 1 (FETCH) + (3N - 2) (COMPUTE) + 1 (TURN) + N (DRAIN) + 1 (FINISH)
           = 4N + 2 cycles
 ```
+
+**Why the read indices are issued in `FETCH` and not in `PRIME`** (spec v1.1.0
+correction): `clr_acc` is asserted only during `PRIME`. If `PRIME` issued the `k = 0`
+indices, the `k = 0` operands would reach the array edge during `FETCH`, be
+accumulated at the end of `FETCH`, and then be presented and accumulated *again* at
+`COMPUTE` `t = 0` — double-counting the `k = 0` product in every element of C.
+Issuing in `FETCH` leaves `PRIME` as a pure accumulator-clear cycle, keeps
+`T_mm = 4N + 2` unchanged, and yields the exact C required by REQ-097 and REQ-105.
 
 For `N = 8`: **`T_mm = 34` cycles**. For `N = 16`: 66 cycles.
 
@@ -1303,10 +1492,45 @@ parameterisation, so adding saturation logic would add area and an untestable br
   the accumulators so that no residue of the first operation appears in C.
 - **REQ-118** An operation started while `mem_a`/`mem_b` contain all zeros shall
   produce an all-zero C and shall set `DONE` normally.
-- **REQ-119** Writing A and B with a single 32-DW `MWr` burst and writing them
-  byte-by-byte with 64 single-DW `MWr` TLPs shall produce identical results.
-- **REQ-120** Reading C with a single 32-DW `MRd` and with 64 single-DW `MRd`
-  requests shall return identical data.
+- **REQ-119** *(reworded in v1.1.0, corrected again in v1.1.2 — see the note below.)*
+  Let `DW_op = ceil(N*N/4)` be the DWORD size of one operand matrix. Loading A and B
+  with the **minimum number of maximal bursts**, i.e. `ceil(DW_op/32)` `MWr` TLPs of
+  up to 32 DWORDs each at `BAR0 + 0x1000` and the same again at `BAR0 + 0x2000`,
+  shall leave `mem_a` and `mem_b` holding exactly the same bytes as loading the same
+  data with `2*DW_op` single-DW `MWr` TLPs, and the operation run afterwards shall
+  produce identical C. At `N = 8`: `DW_op = 16`, so one 16-DW burst per operand versus
+  32 single-DW writes. At `N = 16`: `DW_op = 64`, so **two** 32-DW bursts per operand
+  versus 128 single-DW writes. At `N = 32`: `DW_op = 256`, so eight 32-DW bursts per
+  operand.
+- **REQ-120** *(reworded in v1.1.0; re-confirmed correct in v1.1.2.)* Reading the
+  whole of C with the **minimum number of maximal bursts**, i.e. `ceil(N*N/32)` `MRd`
+  TLPs of up to 32 DWORDs each, shall return byte-for-byte the same data as reading it
+  with `N*N` single-DW `MRd` TLPs. At `N = 8` that is two 32-DW reads versus 64
+  single-DW reads, both covering all 256 bytes of C.
+
+> **Why REQ-119 needed a second repair (v1.1.2).** The v1.1.0 wording said "one
+> maximal burst per operand" of `ceil(N*N/4)` DWORDs. That is fine up to `N = 8`
+> (16 DW) but exceeds the 32-DW burst cap of REQ-018 and REQ-056 at `N = 16` (64 DW)
+> and `N = 32` (256 DW), so the requirement was still unsatisfiable for two of the five
+> legal values of `N` — the same defect class as v1.0.0, merely moved. The burst count
+> is now `ceil(DW_op/32)`, which is correct for every legal `N`.
+>
+> **REQ-120 was re-checked under the same lens and is correct as written.** C is
+> `N*N` DWORDs, so `ceil(N*N/32)` bursts of at most 32 DW each covers it with no burst
+> exceeding the cap, for every legal `N`: 1 burst at `N`=2 and 4, 2 at `N`=8, 8 at
+> `N`=16, 32 at `N`=32. At `N = 32` the C region is exactly 4096 bytes, so the last
+> burst ends exactly on the region boundary and none overruns it (REQ-044).
+
+> **Why these two were wrong in v1.0.0.** REQ-119 asked for "a single 32-DW `MWr`
+> burst" covering both A and B. At `N = 8`, A is 16 DW at `0x1000` and B is 16 DW at
+> `0x2000`; they sit in different 4 KiB regions of the BAR0 map (§9.2) and REQ-057
+> forbids a burst wrapping between regions, so no single burst can reach both. The
+> "64 single-DW" figure was also wrong: A and B together are 32 DW, not 64. REQ-120
+> asked for "a single 32-DW `MRd`" of C, but C at `N = 8` is 64 DW, so one maximal
+> burst reaches only half of it, while the 64 single-DW reads it was compared
+> against covered all of it — the two sides did not cover the same bytes. REQ-056
+> caps any burst at 32 DW, so a full C read needs two bursts. Both are now stated in
+> terms of `N` so they stay true for every legal `N`.
 - **REQ-121** The device shall be re-enumerable after `rst` without power cycling:
   BAR0 returns to `0x00000000` and `Command.MSE` returns to 0.
 
@@ -1389,16 +1613,16 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-068 | 10.3 | `CTRL` always reads `0x00000000`. |
 | REQ-069 | 10.3 | `CTRL.START` while not `BUSY` starts one multiply, sets `BUSY`, clears `DONE`, clears accumulators. |
 | REQ-070 | 10.3 | `CTRL.START` while `BUSY` is ignored and sets `STATUS.ERR_START_BUSY`. |
-| REQ-071 | 10.3 | `CTRL.SOFT_RESET` returns the engine to IDLE and clears BUSY/DONE/errors/PERF_CYCLES/accumulators within 2 cycles, leaving A/B/C, SCRATCH, IRQ_ENABLE, OP_COUNT and config space unchanged. |
+| REQ-071 | 10.3 | `CTRL.SOFT_RESET` returns the engine to IDLE and clears BUSY/DONE/errors/PERF_CYCLES/accumulators within 2 cycles, leaving A, B, SCRATCH, IRQ_ENABLE, OP_COUNT and config space unchanged, and not itself modifying `mem_c` (see REQ-125). **Reworded in v1.1.0.** |
 | REQ-072 | 10.3 | `SOFT_RESET` takes precedence over `START` when both are written in one DWORD. |
 | REQ-073 | 10.3 | `CTRL` bits act only when their byte's Byte Enable is 1. |
 | REQ-074 | 10.4 | `STATUS.BUSY` reads 1 exactly over `[t_start+1, t_done]` and 0 elsewhere. |
 | REQ-075 | 10.4 | `STATUS.DONE` is set on completion and persists until W1C, `SOFT_RESET` or `rst`. |
 | REQ-076 | 10.4 | A W1C bit clears only when written with 1 and its Byte Enable is 1; writing 0 leaves it unchanged. |
-| REQ-077 | 10.4 | On a simultaneous set and W1C clear of the same status bit, the set wins. |
+| REQ-077 | 10.4 | On a simultaneous set and W1C clear of the same status bit, the set wins, uniformly for all four W1C bits. (Only the `DONE` collision is reachable — see the §10.4 note.) |
 | REQ-078 | 10.4 | `STATUS[31:5]` reads 0 and ignores writes. |
 | REQ-079 | 10.5 | `IRQ_STATUS` reads `STATUS & IRQ_ENABLE` and ignores writes. |
-| REQ-080 | 10.5 | `irq` is 1 iff `IRQ_STATUS != 0`; level-sensitive, active high; no MSI. |
+| REQ-080 | 10.5 | `irq` tracks `IRQ_STATUS != 0` within 2 cycles in both directions; registered, level-sensitive, active high; no MSI. **Reworded in v1.1.0.** |
 | REQ-081 | 10.5 | Clearing the responsible `STATUS` or `IRQ_ENABLE` bit deasserts `irq` within 2 cycles. |
 | REQ-082 | 10.6 | `PERF_CYCLES` reports the cycle count of the most recently completed operation. |
 | REQ-083 | 10.6 | `SCRATCH` is a byte-writable 32-bit RW register with no side effects, reset `0x00000000`. |
@@ -1437,8 +1661,19 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-116 | 15 | The full operating sequence of §15 completes with no UR and no error bit set. |
 | REQ-117 | 15 | Two consecutive operations without reset each produce correct results; no accumulator residue. |
 | REQ-118 | 15 | An operation on all-zero A and B produces all-zero C and sets `DONE` normally. |
-| REQ-119 | 15 | A/B written as one 32-DW burst and as 64 single-DW writes give identical results. |
-| REQ-120 | 15 | C read as one 32-DW burst and as 64 single-DW reads returns identical data. |
+| REQ-119 | 15 | A and B loaded as `ceil(ceil(N*N/4)/32)` maximal bursts per operand give the same bytes and the same C as `2*ceil(N*N/4)` single-DW writes. **Reworded in v1.1.0, corrected again in v1.1.2 (the v1.1.0 form was still impossible at `N`=16 and 32).** |
+| REQ-120 | 15 | All of C read as `ceil(N*N/32)` maximal bursts (2 x 32 DW at `N=8`) returns the same bytes as `N*N` single-DW reads. **Reworded in v1.1.0; re-confirmed correct for all legal `N` in v1.1.2.** |
 | REQ-121 | 15 | After `rst` the device is re-enumerable: BAR0 = `0x00000000`, `Command.MSE` = 0. |
+| REQ-122 | 9.6 | `D_WR` is one fixed constant in 1..3 for every BAR0 write, independent of region, burst position, Byte Enables and `N`. **New in v1.1.0.** |
+| REQ-123 | 9.6 | With no stalls, `STATUS.DONE` is set at exactly `t_beat + 4*N + 2` (34 at `N=8`), where `t_beat` is the cycle the `CTRL.START` payload DWORD transfers on `rx_tlp_*`. **New in v1.1.0; off-by-one corrected in v1.1.1.** |
+| REQ-124 | 10.3 | `START` + `SOFT_RESET` in one DWORD while `BUSY`: `SOFT_RESET` takes full effect, `START` is ignored, `STATUS.ERR_START_BUSY` reads 0 afterwards. **New in v1.1.0.** |
+| REQ-125 | 10.3 | `SOFT_RESET` during `DRAIN` aborts the drain; every `mem_c` word then holds either its pre-operation value or its correct new value, never an undefined one. **New in v1.1.0.** |
+| REQ-126 | 7.6 | `CfgRd0`/`CfgWr0` with `Length != 1` -> UR Completion, no config register modified, surplus payload drained to `eop`, `STATUS.ERR_UNSUP_REQ` set. **New in v1.1.2.** |
 
-**Total: 121 requirements, REQ-001 … REQ-121, unique and contiguous.**
+**Total: 126 requirements, REQ-001 … REQ-126, unique and contiguous.**
+
+REQ-001 … REQ-121 keep the identical IDs they had in v1.0.0; none has ever been
+renumbered or repurposed. REQ-122 … REQ-125 were added in v1.1.0; REQ-126 in v1.1.2.
+The existing IDs whose *wording* changed are REQ-071, REQ-080, REQ-119 and REQ-120
+(REQ-119 twice: v1.1.0 and again in v1.1.2), plus REQ-123's value correction in
+v1.1.1 — `tb/TESTPLAN.md` should be re-checked for those five only.

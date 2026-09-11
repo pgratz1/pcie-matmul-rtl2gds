@@ -13,7 +13,9 @@ from cocotb.triggers import ClockCycles
 
 from tb_common import (G, clear_status, discover_n, load_ab, make_tb,
                        mrd_dword, mwr_burst, mwr_dword, read_c, run_op,
-                       start_op, wait_done, wait_for, assert_matrix_equal)
+                       start_op, wait_done, wait_for, assert_matrix_equal,
+                       measure_d_wr, measure_d_wr_falling, cycle_now,
+                       wait_value_cycle, inject_and_get_beat, TbTimeout)
 
 RESET_VALUES = [
     (G.REG_ID, G.ID_VALUE, "REQ-065"),
@@ -240,11 +242,20 @@ async def test_reg_irq_enable_rw_and_reserved(dut):
             f"0x{value:08x}, expected 0x{model.irq_enable:08x}")
 
 
-@cocotb.test(timeout_time=400, timeout_unit="us")
+@cocotb.test(timeout_time=600, timeout_unit="us")
 async def test_reg_irq_status_and_irq_pin(dut):
-    """REQ-012, REQ-079, REQ-080, REQ-081: IRQ_STATUS = STATUS & IRQ_ENABLE."""
+    """REQ-012, REQ-079, REQ-080, REQ-081: IRQ_STATUS = STATUS & IRQ_ENABLE.
+
+    REQ-080 was reworded in spec v1.1.0: `irq` must *track* `IRQ_STATUS != 0`
+    **within 2 clock cycles in both directions**, not match it in the same
+    cycle (which would have contradicted REQ-012's registered output).  The
+    2-cycle window is measured from the cycle the responsible write commits,
+    which is `t_beat + D_WR` (spec 9.6), so this test measures D_WR first.
+    """
     tb = await make_tb(dut)
     await discover_n(tb)
+    d_wr = await measure_d_wr(tb)
+    dut._log.info("D_WR = %d cycles", d_wr)
 
     # DONE set but not enabled -> IRQ_STATUS 0, irq low
     await run_op_no_clear(tb)
@@ -255,17 +266,45 @@ async def test_reg_irq_status_and_irq_pin(dut):
     assert int(dut.irq.value) == 0, (
         "REQ-080: irq asserted while IRQ_STATUS is 0")
 
-    # Enable DONE -> IRQ_STATUS reflects it and irq asserts
-    await mwr_dword(tb, G.REG_IRQ_ENABLE, G.ST_DONE)
+    # --- assertion edge: enable DONE_EN, irq must follow within 2 cycles ----
+    tlp = tb.make_mem_write(tb.bar0_addr + G.REG_IRQ_ENABLE,
+                            G.ST_DONE.to_bytes(4, "little"))
+    cap = tb.shim.start_capture()
+    try:
+        watcher = cocotb.start_soon(
+            wait_value_cycle(dut.clk, dut.irq, 1, "irq", 64))
+        t_beat = await inject_and_get_beat(tb, tlp)
+        t_irq = await watcher
+    finally:
+        tb.shim.stop_capture()
+    lag = t_irq - (t_beat + d_wr)
+    assert 1 <= lag <= 2, (
+        f"REQ-080: irq asserted {lag} cycles after IRQ_STATUS became "
+        f"non-zero (write beat at cycle {t_beat}, D_WR = {d_wr}, irq high "
+        f"from cycle {t_irq}).  Spec v1.1.0 requires assertion within 2 "
+        "cycles; REQ-012 makes it a registered output, so 1 is expected")
+
     irqs = await tb.read_dword(G.REG_IRQ_STATUS)
     assert irqs == G.ST_DONE, (
         f"REQ-079: IRQ_STATUS = 0x{irqs:08x}, expected 0x{G.ST_DONE:08x} "
         "(STATUS.DONE & IRQ_ENABLE.DONE_EN)")
-    await wait_for(dut.irq, 1, "irq", 8, dut.clk)
 
-    # REQ-081: clearing STATUS.DONE deasserts irq within 2 cycles
-    await mwr_dword(tb, G.REG_STATUS, G.ST_DONE, quiet_cycles=2)
-    await wait_for(dut.irq, 0, "irq", 8, dut.clk)
+    # --- deassertion edge: W1C of STATUS.DONE, REQ-080 / REQ-081 -----------
+    tlp = tb.make_mem_write(tb.bar0_addr + G.REG_STATUS,
+                            G.ST_DONE.to_bytes(4, "little"))
+    cap = tb.shim.start_capture()
+    try:
+        watcher = cocotb.start_soon(
+            wait_value_cycle(dut.clk, dut.irq, 0, "irq", 64))
+        t_beat = await inject_and_get_beat(tb, tlp)
+        t_irq = await watcher
+    finally:
+        tb.shim.stop_capture()
+    lag = t_irq - (t_beat + d_wr)
+    assert 1 <= lag <= 2, (
+        f"REQ-080/REQ-081: irq deasserted {lag} cycles after IRQ_STATUS "
+        f"became zero (W1C beat at cycle {t_beat}, D_WR = {d_wr}).  Spec "
+        "v1.1.0 allows at most 2")
 
     # REQ-081 again, this time by clearing IRQ_ENABLE
     await start_op(tb)
@@ -283,6 +322,164 @@ async def test_reg_irq_status_and_irq_pin(dut):
     assert irqs == (st & en), (
         f"REQ-079: IRQ_STATUS = 0x{irqs:08x} but STATUS & IRQ_ENABLE = "
         f"0x{st & en:08x}; IRQ_STATUS is read-only and continuously evaluated")
+
+
+@cocotb.test(timeout_time=900, timeout_unit="us")
+async def test_reg_write_path_delay_is_constant(dut):
+    """REQ-122: D_WR is one fixed constant in 1..3.
+
+    Spec 9.6 (v1.1.1) defines `D_WR = t_commit - t_beat` as a write-*visibility*
+    property only: a write taken at `t` is readable at `t + D_WR`.  It is
+    deliberately not a term in any latency formula.
+
+    Two complementary checks:
+
+    1. **Exact value.** Measured at the chip boundary through `irq`, which
+       REQ-012 makes a registered (exactly 1 cycle) copy of |IRQ_STATUS, so
+       `D_WR = t_irq - t_beat - 1`.  Repeated for a second register offset and
+       the opposite direction (W1C of STATUS.DONE, irq falling), for three
+       byte-enable patterns, and for the first / middle / last DWORD of a
+       multi-DWORD burst.  Every measurement must give the identical value.
+
+    2. **Visibility invariant across regions.** `irq` only reflects
+       `reg_file` state, so the exact measurement cannot reach `mem_a`,
+       `mem_b` or `mem_c`.  For those the invariant is checked in its
+       read-after-write form: an `MRd` of the just-written location, injected
+       with zero idle cycles behind the `MWr`, must return the new value --
+       for every region, every byte-enable pattern and every position within
+       a burst.  If any region's write path committed later than its request
+       retires, that read would return stale data.
+    """
+    tb = await make_tb(dut)
+    n = await discover_n(tb)
+
+    measurements = []
+
+    base = await measure_d_wr(tb)
+    measurements.append(("IRQ_ENABLE, single DW, BE=1111, irq rising", base))
+
+    measurements.append(
+        ("STATUS W1C, single DW, BE=1111, irq falling",
+         await measure_d_wr_falling(tb)))
+
+    for be in (0b0011, 0b0001, 0b1111):
+        measurements.append(
+            (f"IRQ_ENABLE, single DW, BE={be:04b}",
+             await measure_d_wr(tb, be=be)))
+
+    # Burst position: IRQ_ENABLE (0x0014) first, middle and last DWORD.
+    # 0x000C (CTRL) is deliberately never inside these bursts.
+    for burst, where in (((0x0014, 4, 0), "first DWORD of a 4 DW burst"),
+                         ((0x0010, 3, 1), "middle DWORD of a 3 DW burst"),
+                         ((0x0010, 2, 1), "last DWORD of a 2 DW burst")):
+        measurements.append(
+            (f"IRQ_ENABLE as the {where}",
+             await measure_d_wr(tb, burst=burst)))
+
+    for what, value in measurements:
+        dut._log.info("D_WR = %d  (%s)", value, what)
+
+    assert 1 <= base <= 3, (
+        f"REQ-122: D_WR measured as {base} cycles; spec 9.6 requires "
+        "1 <= D_WR <= 3")
+
+    bad = [(what, v) for what, v in measurements if v != base]
+    assert not bad, (
+        f"REQ-122: D_WR is not a single constant.  Baseline {base} cycles "
+        f"(IRQ_ENABLE, single DW, BE=1111); differing measurements: "
+        + "; ".join(f"{what} -> {v}" for what, v in bad) +
+        ".  Spec 9.6 requires D_WR to be identical regardless of offset, "
+        "byte enables and position within a burst.")
+
+    dut._log.info("REQ-122: D_WR = %d cycles, constant across %d "
+                  "measurements at N=%d", base, len(measurements), n)
+
+    # --- part 2: write-visibility invariant, every region ----------------
+    regions = [("reg_file (SCRATCH)", G.REG_SCRATCH, 1),
+               ("mem_a", G.MEM_A_BASE, n * n // 4),
+               ("mem_b", G.MEM_B_BASE, n * n // 4),
+               ("mem_c", G.MEM_C_BASE, n * n)]
+    patterns = [(0xF, 0xA5A5A5A5), (0x1, 0x000000C3), (0x8, 0xD7000000),
+                (0x6, 0x00BEEF00), (0xF, 0x00000000)]
+
+    for name, base_off, n_dwords in regions:
+        shadow = {}
+        for k, (be, value) in enumerate(patterns):
+            word = k % max(1, n_dwords)
+            off = base_off + 4 * word
+            prev = shadow.get(off, 0)
+            expect = 0
+            for j in range(4):
+                byte = ((value if (be >> j) & 1 else prev) >> (8 * j)) & 0xFF
+                expect |= byte << (8 * j)
+
+            # MWr immediately followed by an MRd of the same DWORD, with no
+            # idle cycle between eop and the next sop.
+            cap = tb.shim.start_capture()
+            try:
+                await tb.shim.inject(tb.make_mem_write(
+                    tb.bar0_addr + off,
+                    int(value).to_bytes(4, "little"), first_be=be))
+                rd = tb.make_mem_read(tb.bar0_addr + off, length=1)
+                await tb.shim.inject(rd)
+                cpl = await tb._get_capture(cap, 20000, rd)
+            finally:
+                tb.shim.stop_capture()
+
+            got = int.from_bytes(cpl.get_data(), "little")
+            assert got == expect, (
+                f"REQ-122: in {name}, a read of BAR0+0x{off:04x} issued with "
+                f"zero idle cycles behind the write returned 0x{got:08x}, "
+                f"expected 0x{expect:08x} (wrote 0x{value:08x} with First BE "
+                f"= 0b{be:04b} over 0x{prev:08x}).  A write taken at t must "
+                "be readable at t + D_WR, and D_WR must be the same in every "
+                "region")
+            shadow[off] = expect
+
+    # Leave the operand storages as we found them.
+    await tb.mem_write(G.MEM_A_BASE, bytes(n * n))
+    await tb.mem_write(G.MEM_B_BASE, bytes(n * n))
+    await tb.mem_write(G.MEM_C_BASE, bytes(4 * n * n))
+    await mwr_dword(tb, G.REG_SCRATCH, 0x00000000)
+
+
+@cocotb.test(timeout_time=400, timeout_unit="us")
+async def test_reg_start_and_soft_reset_while_busy(dut):
+    """REQ-124: START|SOFT_RESET written together while BUSY.
+
+    SOFT_RESET takes full effect, START is ignored entirely, and
+    ERR_START_BUSY must read 0 afterwards.
+    """
+    tb = await make_tb(dut)
+    n = await discover_n(tb)
+    a = [[(i + j) % 5 - 2 for j in range(n)] for i in range(n)]
+    b = [[(i * 2 + j) % 7 - 3 for j in range(n)] for i in range(n)]
+    await load_ab(tb, a, b, n)
+
+    # Two CTRL writes back-to-back: the second lands inside the 4N+2 window.
+    await mwr_burst(tb, [(G.REG_CTRL, G.CTRL_START, 0xF),
+                         (G.REG_CTRL, G.CTRL_START | G.CTRL_SOFT_RESET, 0xF)])
+
+    st = await tb.read_dword(G.REG_STATUS)
+    assert st & G.ST_ERR_START_BUSY == 0, (
+        f"REQ-124: STATUS = 0x{st:08x} after writing START|SOFT_RESET while "
+        "BUSY; ERR_START_BUSY (bit 2) must NOT be left set")
+    assert st == 0, (
+        f"REQ-124/REQ-071: STATUS = 0x{st:08x}; SOFT_RESET must take full "
+        "effect, clearing BUSY, DONE and every error bit")
+    pc = await tb.read_dword(G.REG_PERF_CYCLES)
+    assert pc == 0, (
+        f"REQ-124/REQ-071: PERF_CYCLES = {pc} after SOFT_RESET, must be 0")
+    oc = await tb.read_dword(G.REG_OP_COUNT)
+    assert oc == 0, (
+        f"REQ-124: OP_COUNT = {oc}; the aborted operation never completed and "
+        "the START written alongside SOFT_RESET must be ignored entirely")
+
+    # The device must still work afterwards.
+    await run_op(tb)
+    got = await read_c(tb, n)
+    assert_matrix_equal(got, G.matmul_golden(a, b, n),
+                        "C after a START|SOFT_RESET abort and a clean re-run")
 
 
 @cocotb.test(timeout_time=400, timeout_unit="us")
@@ -356,8 +553,12 @@ async def test_reg_soft_reset(dut):
         f"REQ-084: OP_COUNT = {oc} after SOFT_RESET; it counts operations "
         "since rst and is explicitly NOT cleared by SOFT_RESET (expected 2)")
     c_after = await read_c(tb, n)
-    assert_matrix_equal(c_after, exp_c, "C after SOFT_RESET",
-                        extra="  REQ-092: SOFT_RESET must not clear mem_c.")
+    assert_matrix_equal(
+        c_after, exp_c, "C after SOFT_RESET while the engine was IDLE",
+        extra="  REQ-071 (v1.1.0, narrowed): SOFT_RESET shall not itself "
+              "modify any word of mem_c.  The engine is IDLE here, so no "
+              "drain is in flight and REQ-125's mixed-state case does not "
+              "apply: C must be bit-identical.")
 
     # REQ-121 / REQ-111 check that config space survives SOFT_RESET
     bar0 = await tb.cfg_read_dword(0x10)

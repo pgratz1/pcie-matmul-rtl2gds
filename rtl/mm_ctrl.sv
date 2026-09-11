@@ -40,7 +40,11 @@
 // Latency: 4N+2 cycles from start to done_set + 1.
 //
 // Implements: REQ-069, REQ-071, REQ-074, REQ-082, REQ-095, REQ-096, REQ-098,
-//             REQ-099, REQ-101, REQ-102, REQ-103, REQ-104.
+//             REQ-099, REQ-101, REQ-102, REQ-103, REQ-104,
+//             REQ-125 (soft_reset is honoured in every state including DRAIN:
+//             it returns the FSM to IDLE on the next edge and stops issuing
+//             mem_c row writes, so already-drained rows keep their new values
+//             and rows not yet reached keep their prior values).
 // ---------------------------------------------------------------------------
 module mm_ctrl #(
     parameter int N    = 8,

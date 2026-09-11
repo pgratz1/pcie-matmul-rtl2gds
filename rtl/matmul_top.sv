@@ -26,6 +26,29 @@
 //   CTRL.START accepted at t -> STATUS.DONE reads 1 at t + 4N + 2.
 //
 // Implements: REQ-010, REQ-011, REQ-012, REQ-107, REQ-113.
+//
+// Whole-tree properties asserted at this level because no single submodule owns
+// them:
+//   REQ-109 - every flop in the tree uses the same synchronous reset, so holding
+//             rst for >= 2 clk cycles reaches the spec 13.4 reset state.
+//   REQ-110 - no `initial` block, no `#` delay and no `$display` appears
+//             anywhere under rtl/; all reset values come from `rst`.
+// System-level behaviours that emerge from the wiring below rather than from any
+// one module, and are verified end to end at the chip boundary:
+//   REQ-116 - the spec 15 operating sequence completes with no UR and no error
+//             bit set.
+//   REQ-117 - back-to-back operations: mm_ctrl asserts clr_acc in PRIME on every
+//             START, so no accumulator residue survives into the next operation.
+//   REQ-118 - an all-zero A and B still runs the full 4N+2 sequence and sets DONE.
+//   REQ-119 - A/B loaded by maximal MWr bursts or by single-DWORD writes are
+//             identical: app_bar0 decodes every DWORD of a burst from its own
+//             address and applies Byte Enables per beat.
+//   REQ-120 - C read by maximal MRd bursts or by single-DWORD reads is identical
+//             for the same reason on the read path.
+//   REQ-122 - D_WR = 1 for every BAR0 write: the write strobe into reg_file /
+//             mem_a / mem_b / mem_c is combinational from the accepted payload
+//             beat, so storage always commits on the edge that ends that beat,
+//             independently of region, burst position, Byte Enables and N.
 // ---------------------------------------------------------------------------
 module matmul_top #(
     parameter int N    = 8,     // systolic array dimension; power of two, 2..32
@@ -71,7 +94,6 @@ module matmul_top #(
     logic         app_rdata_valid;
     logic         app_rdata_ready;
     logic [31:0]  app_rdata;
-    logic         app_rdata_last;
     logic         ev_unsup_req;
 
     // app_bar0 <-> matmul_engine
@@ -144,7 +166,6 @@ module matmul_top #(
         .rdata_valid    (app_rdata_valid),
         .rdata_ready    (app_rdata_ready),
         .rdata          (app_rdata),
-        .rdata_last     (app_rdata_last),
         .ev_unsup_req   (ev_unsup_req),
         .eng_start      (eng_start),
         .eng_soft_reset (eng_soft_reset),
@@ -186,11 +207,5 @@ module matmul_top #(
         .c_wr_row    (eng_c_row),
         .c_wr_data   (eng_c_data)
     );
-
-    // app_bar0 tracks the burst length itself and tlp_tx counts payload beats
-    // from the Completion Length field, so rdata_last has no consumer. Kept on
-    // the interface because spec 7.3 lists it. Explicit sink for the linter.
-    logic unused_rdata_last;
-    assign unused_rdata_last = app_rdata_last;
 
 endmodule

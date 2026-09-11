@@ -1,10 +1,10 @@
 # Test plan — PCIe-Attached Matrix Multiplier
 
-**Against:** `docs/spec.md` v1.0.0, `docs/register-map.md` v1.0.0
-**Owner:** test-writer · **Phase 2 deliverable**
-**Status:** 65 cocotb tests + 5 static structural checks + 1 elaboration sweep.
-**Coverage: 121 of 121 requirements mapped. 120 verified, 1 (REQ-077) not
-verifiable at the chip boundary — see "Uncovered" at the bottom.**
+**Against:** `docs/spec.md` **v1.1.2**, `docs/register-map.md` v1.0.0
+**Owner:** test-writer · **Phase 2 deliverable, updated for spec v1.1.0 → v1.1.2**
+**Status:** 71 cocotb tests + 5 static structural checks + 1 elaboration sweep.
+**Coverage: 126 of 126 requirements mapped. 125 verified by test, 1 (REQ-077)
+verified by review — see "Uncovered" at the bottom.**
 
 Every expected value in this suite comes from `docs/spec.md`,
 `docs/register-map.md` or `tb/models/golden.py`. No test asserts against a
@@ -48,10 +48,10 @@ from it. The suite has been run green at `N=4`, `N=8` and `N=16`.
 | `tb/models/golden.py` | Exact INT8×INT8→INT32 reference (spec 12.6), spec 7.5 byte-enable tables, `RegModel`, `DeviceModel` scoreboard |
 | `tb/tests/tb_common.py` | Shared helpers: bring-up, `discover_n`, `run_op`, byte-enabled raw accesses |
 | `tb/tests/test_smoke.py` | 4 tests |
-| `tb/tests/test_regs.py` | 13 tests |
+| `tb/tests/test_regs.py` | 15 tests |
 | `tb/tests/test_tlp.py` | 23 tests |
-| `tb/tests/test_cfg.py` | 8 tests |
-| `tb/tests/test_matmul.py` | 16 tests |
+| `tb/tests/test_cfg.py` | 11 tests |
+| `tb/tests/test_matmul.py` | 17 tests |
 | `tb/tests/test_stress.py` | 1 test (120 randomized operations, scoreboarded) |
 | `tb/tools/check_rtl_rules.py` | 5 static structural checks, run by `make lint` |
 
@@ -77,6 +77,7 @@ simulation in the suite is a test of them:
 
 ## 4. Requirement → test map
 
+Rows marked *(new …)* / *(reworded …)* changed in spec v1.1.0 or v1.1.1.
 `static:` = `tb/tools/check_rtl_rules.py`, run by `make -C tb lint`.
 `shim:` = the always-on checker of section 3.
 
@@ -102,7 +103,7 @@ simulation in the suite is a test of them:
 | REQ-018 | `test_tlp_malformed_length_rejected`, `test_tlp_oversize_write_discarded_and_framing_kept` | `Length` 33 / 64 / 1023 rejected for MRd and MWr |
 | REQ-019 | `test_tlp_oversize_write_discarded_and_framing_kept` | after a rejected 33 DW MWr, the *next* TLP is parsed correctly (framing kept) |
 | REQ-020 | `test_tlp_sop_resynchronisation` | a truncated 2-beat TLP followed by a fresh `sop` — the second TLP is the one that takes effect |
-| REQ-021 | `test_tlp_requests_serviced_in_order`, `test_matmul_done_timing` | bounded: request-to-effect latency is inside the window the spec allows (see §6 note 1) |
+| REQ-021 | `test_tlp_requests_serviced_in_order`, `test_reg_write_path_delay_is_constant` | §9.6's `D_WR` closes the old observability gap: the write path's request-to-effect delay is measured exactly (1 cycle) and shown to be constant |
 | REQ-022 | `test_tlp_burst_ascending_and_independent_decode` | a 32 DW MWr lands in ascending address order, exactly `Length` DWORDs |
 | REQ-023 | `shim:`, `test_tlp_mrd_completion_fields` | each completion is one contiguous framed packet, 3 header DW + `Length` payload DW |
 | REQ-024 | `test_tlp_completion_reserved_fields_and_ids` (and `_check_reserved_fields` in every completion test) | raw DW bits: T9, T8, LN, TH, TD, EP, AT, BCM, DW2[7] all 0 |
@@ -152,16 +153,16 @@ simulation in the suite is a test of them:
 | REQ-068 | `test_reg_ctrl_reads_zero_and_be_gated` | `CTRL` reads 0 before and after a START write |
 | REQ-069 | `test_smoke_single_multiply`, `test_matmul_back_to_back` | START runs one multiply, sets BUSY, clears DONE, clears accumulators |
 | REQ-070 | `test_matmul_start_while_busy`, `test_reg_soft_reset` | 3 back-to-back STARTs → `ERR_START_BUSY`, `OP_COUNT` == 1, C still correct |
-| REQ-071 | `test_reg_soft_reset`, `test_matmul_soft_reset_during_operation` | clears STATUS/PERF_CYCLES/accumulators; leaves A/B/C, SCRATCH, IRQ_ENABLE, OP_COUNT, cfg space (incl. BAR0) alone |
+| REQ-071 *(reworded v1.1.0)* | `test_reg_soft_reset`, `test_matmul_soft_reset_during_operation`, `test_matmul_soft_reset_during_drain` | clears STATUS/PERF_CYCLES/accumulators; leaves A, B, SCRATCH, IRQ_ENABLE, OP_COUNT, cfg space (incl. BAR0) alone. The `mem_c` clause is now the narrowed one: with the engine IDLE, SOFT_RESET must not itself modify any word of C (checked bit-identical); the mid-`DRAIN` case moved to REQ-125 |
 | REQ-072 | `test_reg_soft_reset_precedence` | `START\|SOFT_RESET` in one DWORD starts nothing (`OP_COUNT` stays 0) |
 | REQ-073 | `test_reg_ctrl_reads_zero_and_be_gated` | CTRL writes with First BE ∈ {1110,0010,1000,0000} do nothing; BE 0001 works |
-| REQ-074 | `test_matmul_done_timing`, `test_matmul_busy_is_zero_when_idle` | BUSY 0 before START and after DONE; the operation's length is checked exactly via `PERF_CYCLES` |
+| REQ-074 *(`t_start` pinned in v1.1.1)* | `test_matmul_done_timing`, `test_matmul_busy_is_zero_when_idle` | BUSY 0 before START and after DONE; with `t_start = t_beat` the operation's length is now checked exactly, both via `PERF_CYCLES` and via REQ-123's pin-observable `t_beat + 4N + 2` |
 | REQ-075 | `test_reg_status_w1c` | DONE set on completion and persists across a read and a write of 0 |
 | REQ-076 | `test_reg_status_w1c`, `test_reg_status_w1c_byte_enable_gating` | writing 0 leaves it set; writing 1 with BE 0b1110 leaves it set; writing 1 with BE 0b0001 clears it |
 | REQ-077 | **not verifiable at the chip boundary** — see "Uncovered" | |
 | REQ-078 | `test_reg_status_w1c` | after writing 0xFFFFFFFF, STATUS[31:5] read 0 |
 | REQ-079 | `test_reg_irq_status_and_irq_pin`, `test_reg_irq_enable_rw_and_reserved` | `IRQ_STATUS == STATUS & IRQ_ENABLE`, RO; IRQ_ENABLE bit 0 and 31:5 are RO 0 |
-| REQ-080 | `test_reg_irq_status_and_irq_pin` | `irq` high iff `IRQ_STATUS != 0` |
+| REQ-080 *(reworded v1.1.0)* | `test_reg_irq_status_and_irq_pin` | `irq` **tracks** `IRQ_STATUS != 0` within 2 cycles in both directions. The lag is measured exactly: the responsible write commits at `t_beat + D_WR` (D_WR measured per REQ-122), and `irq` must change 1–2 cycles later. Checked on both the assertion and the deassertion edge |
 | REQ-081 | `test_reg_irq_status_and_irq_pin` | `irq` deasserts within 8 cycles of W1C-ing STATUS, and of clearing IRQ_ENABLE |
 | REQ-082 | `test_reg_op_count_and_perf_cycles`, `test_matmul_done_timing` | `PERF_CYCLES` after each of 3 operations |
 | REQ-083 | `test_reg_scratch_rw_and_byte_enables` | SCRATCH RW, byte-granular, reset 0, no side effects |
@@ -182,7 +183,7 @@ simulation in the suite is a test of them:
 | REQ-098 | `test_matmul_c_addressing_and_persistence` | C[i][j] = distinct value per element, so any row-order or lane-order error in the drain shows up |
 | REQ-099 | `test_matmul_done_timing` | indirect, as REQ-096 |
 | REQ-100 | `test_matmul_random`, `test_matmul_back_to_back` | indirect: accumulation during drain would add extra products to C |
-| REQ-101 | `test_matmul_done_timing` | exact via `PERF_CYCLES == 4N+2`; at the boundary, START beat → `irq` measured and bounded to `[4N+2, 4N+7]` (§6 note 1) |
+| REQ-101 | `test_matmul_done_timing` | **now exact at the boundary** (v1.1.1): `t_start = t_beat`, DONE observed at exactly `t_beat + 4N + 2` via the registered `irq`, and independently `PERF_CYCLES == 4N+2` |
 | REQ-102 | `test_reg_op_count_and_perf_cycles`, `test_matmul_done_timing` | `PERF_CYCLES` is the constant `4N+2` after every operation (verified at N=4 and N=8) |
 | REQ-103 | `test_matmul_done_timing`, `test_matmul_busy_is_zero_when_idle` | BUSY asserted through DONE, deasserted after |
 | REQ-104 | `test_matmul_start_while_busy`, `test_matmul_soft_reset_during_operation` | a START outside IDLE is ignored |
@@ -200,17 +201,22 @@ simulation in the suite is a test of them:
 | REQ-116 | `test_smoke_single_multiply`, `test_cfg_enumeration_assigns_bar0` | the full spec 15 sequence with no UR and no error bit set |
 | REQ-117 | `test_matmul_back_to_back` | three operations in a row, each compared to the golden model, plus an explicit no-residue check |
 | REQ-118 | `test_matmul_zeros` | all-zero A and B → all-zero C, DONE set, OP_COUNT 1 |
-| REQ-119 | `test_matmul_write_granularity_equivalence` | one burst per operand vs `2*N*N` single-DWORD byte-enabled writes give identical C (§6 note 4) |
-| REQ-120 | `test_matmul_read_granularity_equivalence` | C read as bursts vs `N*N` single-DWORD MRds returns identical bytes |
+| REQ-119 *(reworded v1.1.0, corrected v1.1.2)* | `test_matmul_write_granularity_equivalence` | `ceil(DW_op/32)` maximal bursts per operand (`DW_op = ceil(N*N/4)`) vs `2*DW_op` single-DW `MWr` TLPs: identical `mem_a`/`mem_b` bytes **and** identical C. TLP counts on both sides are asserted, so the two paths provably differ in granularity (§6 note 4) |
+| REQ-120 *(reworded v1.1.0)* | `test_matmul_read_granularity_equivalence` | all of C read with `ceil(N*N/32)` maximal (32 DW) `MRd` bursts vs `N*N` single-DW `MRd`s: byte-for-byte identical, both sides covering all `4*N*N` bytes. TLP counts on both sides are asserted |
+| REQ-122 *(new v1.1.0)* | `test_reg_write_path_delay_is_constant` | D_WR measured exactly through the registered `irq` (REQ-012) and shown to be the **same value** for two register offsets, both irq directions, byte enables 1111/0011/0001, and the first/middle/last DWORD of a burst; asserted to lie in 1..3. Region invariance is checked in read-after-write form across `reg_file`, `mem_a`, `mem_b` and `mem_c` (§6 note 9) |
+| REQ-123 *(new v1.1.0, corrected v1.1.1)* | `test_matmul_done_timing` | `STATUS.DONE` set at **exactly** `t_beat + 4N + 2`, where `t_beat` is the cycle the `CTRL.START` payload DWORD transferred on `rx_tlp_*`; DONE is read off the registered `irq` (`t_done = t_irq − 1`). No `D_WR` term (§6 note 1) |
+| REQ-124 *(new v1.1.0)* | `test_reg_start_and_soft_reset_while_busy` | `START\|SOFT_RESET` in one DWORD while BUSY: STATUS reads 0 afterwards (so `ERR_START_BUSY` is **not** left set), PERF_CYCLES 0, OP_COUNT 0 (the START was ignored entirely), and the device still computes correctly afterwards |
+| REQ-126 *(new v1.1.2)* | `test_cfg_malformed_length_completion_fields`, `test_cfg_malformed_length_framing_preserved`, `test_cfg_malformed_length_sets_unsup_req` | **(a)** `CfgRd0`/`CfgWr0` with `Length` in {0,2,3,4,5,8,32} → a 3-beat `Cpl`, UR, Length 0/ByteCount 4/LowerAddress 0; the first transaction after reset checks the exact `DW0 = 0x0A000000`, `DW1 = 0x00002004` the spec quotes for `cfg_completer_id = 0x0000`. **(b)** a 7-offset configuration snapshot is unchanged across every malformed case. **(c)** after each malformed `CfgWr0` the next TLP parses correctly — checked in config space *and* through BAR0 (`ID` = `0x4D415431`), including two malformed TLPs back-to-back. **(d)** `ERR_UNSUP_REQ` set for malformed `Length` at Device/Function 0 **and** non-zero, paired with a negative control (identical request, `Length = 1`) that must leave the bit clear so REQ-042's bus-scan carve-out stays intact (§6 note 10) |
+| REQ-125 *(new v1.1.0)* | `test_matmul_soft_reset_during_drain` | SOFT_RESET swept across the whole drain window (`3N−1` … `4N+3` cycles after the START beat). For every landing: every `mem_c` word holds either its pre-operation value or its correct new value and never anything else; no row is part-old part-new; and the new rows form the contiguous suffix REQ-098's drain order requires. The sweep must produce at least one partially drained C, else it reports that it never landed inside `DRAIN` |
 | REQ-121 | `test_cfg_reenumerable_after_reset` | after `rst`: BAR0 == 0, MSE == 0, cfg 0x00 still identifies; re-enumeration works and BAR0 is usable |
 
 ---
 
-## 5. Uncovered
+## 5. Uncovered / verified by other means
 
-| REQ | Reason |
-|-----|--------|
-| **REQ-077** — "if a W1C bit's set condition and a clearing write occur on the same clock edge, the set wins" | **Not verifiable at the chip boundary.** The test can only place the STATUS-clearing `MWr` at a chosen cycle on `rx_tlp_*`; spec 7.3 fixes the `rx_tlp_*` → `reg_file` delay only as "no later than", so the test cannot know which injected offset produces the simultaneous case. Worse, the two possible outcomes are individually legal: a clear that lands *before* the set leaves DONE = 1 and a clear that lands *after* leaves DONE = 0, so no single observation distinguishes "set wins" from "clear arrived one cycle late". Verifying it needs either (a) an internal probe on `reg_file`'s set/clear signals, which would make the test dependent on advisory internal names, or (b) a spec amendment fixing the boundary-to-`reg_file` latency to an exact number. **Recommend: rtl-reviewer inspects the `reg_file` W1C priority expression by eye, and records that as the evidence for REQ-077.** |
+| REQ | Disposition |
+|-----|-------------|
+| **REQ-077** — "if a W1C bit's set condition and a clearing write occur on the same clock edge, the set wins" | **Verified by review, not by test.** Not verifiable at the chip boundary: the two possible outcomes are individually legal (a clear that lands before the set leaves the bit at 1; one that lands after leaves it at 0), so no single pin observation distinguishes "set wins" from "the clear arrived a cycle late". The Phase 2b reviewer settled it by inspection — set wins over clear for all four W1C bits, and three of the four collisions are structurally unreachable, so only `DONE` can actually collide. Recorded here so it is not mistaken for a coverage hole. |
 
 Requirements marked "indirect" in the table above (REQ-021, REQ-085, REQ-087,
 REQ-094, REQ-096, REQ-099, REQ-100) are internal to modules whose signal names
@@ -223,21 +229,23 @@ which are checked exactly.
 
 ## 6. Notes, ambiguities and environment findings
 
-**Note 1 — START→DONE is not exactly observable at the chip boundary
-(REQ-101, REQ-021, REQ-074).** REQ-101 says DONE is set "exactly `4*N+2` clock
-cycles after the clock edge on which `CTRL.START` is accepted", where spec 10.4
-defines acceptance as "the cycle on which the `CTRL.START` write DWORD is
-accepted by `reg_file`". A chip-boundary test can only observe the cycle the
-DWORD is accepted on `rx_tlp_*`. Spec 7.3 fixes that relationship only as
-*"`app_req_valid` at cycle `t+3` **at the latest**"*, and spec 6.2/9.6 give only
-`app_bar0`-relative numbers, so the boundary-to-`reg_file` delay is 0–3 cycles by
-specification. `test_matmul_done_timing` therefore (a) checks `PERF_CYCLES` as an
-**exact** constant `4N+2`, which is the exactly-specified and exactly-observable
-form, and (b) bounds the START-beat→`irq` measurement to `[4N+2, 4N+7]`
-(`4N+2` + ≤3 pipeline + 1 registered `irq`). Measured on the current RTL: **35
-cycles at N=8** and **19 at N=4**, i.e. `4N+3`. *Suggestion for spec-writer, not
-a blocker: if the `rx_tlp_*`-to-`reg_file` latency were pinned to an exact number
-in §7.3, REQ-101 would become exactly testable from outside.*
+**Note 1 — START→DONE is now exactly observable (REQ-123, spec v1.1.1).**
+The v1.0.0 gap I reported (§7.3 stated the internal request latency only as an
+upper bound, so REQ-101's exact `4N+2` could be checked only through
+`PERF_CYCLES`) is closed. Spec v1.1.0 added REQ-122/REQ-123 and v1.1.1 fixed
+`t_start = t_beat` and removed `D_WR` from every latency formula — the v1.1.0
+text added `D_WR` on top of a window that already measured from `t_beat`, which
+double-counted the write path by one cycle. `test_matmul_done_timing` now
+asserts `t_done == t_beat + 4N + 2` **exactly**, reading DONE off the
+registered `irq` (REQ-012 gives exactly one cycle of lag, so
+`t_done = t_irq − 1`). Measured: DONE at `t_beat + 34` at N=8 and `t_beat + 18`
+at N=4, both exact, with `PERF_CYCLES` independently `4N+2`.
+
+Exact cycle accounting is provided by `models/host.cycle_now()`, derived from
+sim time rather than from a counting task so it cannot lose a race at a clock
+edge, and by the shim recording the cycle of **every** inbound beat
+(`last_packet_beat_cycles`) so a test can name the beat that carried a
+particular payload DWORD rather than the end-of-packet beat.
 
 **Note 2 — internal latency requirements.** REQ-085/087/094/096/099/100
 describe internal module behaviour; spec 3 says "internal signal names are
@@ -252,14 +260,16 @@ TLP bytes, REQ-041's "any Message" clause is covered by `MWr64` and `IOWr`,
 which exercise the same posted-unsupported decode path in the DUT. Flagging so
 it is not mistaken for an omission.
 
-**Note 4 — REQ-119's "single 32-DW MWr burst" is not achievable as written.**
-At `N = 8`, A is 64 bytes (16 DW) and B is 64 bytes (16 DW), and they sit in
-different 4 KiB BAR0 regions (0x1000 and 0x2000), so no single 32-DW burst can
-cover both and no burst larger than 16 DW can cover either. The test uses one
-burst per operand versus `2*N*N` single-DWORD byte-enabled writes, which is the
-testable intent. A genuine 32-DW burst is exercised separately against the C
-region in `test_tlp_burst_ascending_and_independent_decode`. *Suggestion for
-spec-writer: reword REQ-119 as "one burst per operand".*
+**Note 4 — REQ-119 and REQ-120 (corrected through v1.1.2).** Both are
+expressed in terms of `N`, and the tests derive their TLP counts from `N` and
+assert them, so the two sides provably differ in granularity. REQ-119 took two
+rounds: the v1.1.0 repair ("one maximal burst per operand") was still
+unsatisfiable for `N >= 16`, because `DW_op = ceil(N*N/4)` is 64 DW at N=16 and
+256 DW at N=32, both over the 32-DW cap of REQ-018/REQ-056. v1.1.2 states it as
+`ceil(DW_op/32)` bursts per operand, which is what the test already computed —
+only its documentation changed. REQ-120 was re-checked and is correct at every
+legal `N`: C is `N*N` DW, so `ceil(N*N/32)` is 1/1/2/8/32 for N = 2/4/8/16/32
+and no burst exceeds 32 DW.
 
 **Note 5 — NumPy is not installed in `.venv`.** The agent brief asks for a NumPy
 golden model; `tb/models/golden.py` uses pure-Python integers instead. This is
@@ -296,13 +306,58 @@ reference: spec 5.4 records that it is buggy in 0.2.16 (operator precedence).
 
 ---
 
+**Note 9 — REQ-122's region clause, and why D_WR is measured through `irq`.**
+Spec 9.6 suggests measuring `D_WR` by writing `SCRATCH` and reading it back on
+successive cycles. That is not possible here: DEC-007 makes the DUT strictly
+serialized, so it holds `rx_tlp_ready` low until the write has retired and a
+read-back can never sample the location early. The usable channel is `irq`,
+because REQ-012 makes it a *registered* copy of `|IRQ_STATUS` — exactly one
+cycle of lag, not a bound — so writing `IRQ_ENABLE` while `STATUS.DONE` is
+already set gives `D_WR = t_irq − t_beat − 1`. That channel only reaches
+`reg_file`, so REQ-122's "regardless of target region" clause is covered in its
+read-after-write form instead: an `MRd` of the just-written location injected
+with zero idle cycles behind the `MWr` must return the new value, for
+`reg_file`, `mem_a`, `mem_b` and `mem_c` and for five byte-enable patterns.
+`D_WR` measures **1** on the current RTL, matching rtl-designer's independent
+measurement. Its independence of `N` is exercised by running the test at
+N = 4, 8 and 16 rather than asserted inside one simulation.
+
+**Note 10 — REQ-126 and its negative control.** The config-TLP `Length != 1`
+behaviour I flagged as having no requirement behind it is now REQ-126
+(spec v1.1.2). Clause (d) — "shall set `STATUS.ERR_UNSUP_REQ`" — was written
+into the spec before the RTL had been checked, so it was deliberately left
+unasserted for one round until rtl-designer confirmed the behaviour existed; it
+is now tested. The test asserts (d) **together with a negative control**: the
+same request with `Length = 1` to the same non-zero Device/Function must return
+UR and leave `ERR_UNSUP_REQ` clear. Without that control, a test of (d) would
+pass on an implementation that set the bit on *every* absent-device probe,
+which would break REQ-042 and make ordinary enumeration noisy.
+
+**Note 11 — what the v1.1.0 → v1.1.2 updates changed in `tb/`.** New tests:
+`test_reg_write_path_delay_is_constant` (REQ-122),
+`test_reg_start_and_soft_reset_while_busy` (REQ-124),
+`test_matmul_soft_reset_during_drain` (REQ-125),
+`test_cfg_malformed_length_completion_fields`,
+`test_cfg_malformed_length_framing_preserved`,
+`test_cfg_malformed_length_sets_unsup_req` (REQ-126 a/b/c/d). Rewritten:
+`test_matmul_done_timing` (REQ-123, now exact), `test_reg_irq_status_and_irq_pin`
+(REQ-080's 2-cycle tracking window, measured rather than bounded at 8 cycles),
+`test_matmul_write_granularity_equivalence` (REQ-119),
+`test_matmul_read_granularity_equivalence` (REQ-120). Assertion message only:
+`test_reg_soft_reset` (REQ-071's narrowed `mem_c` clause). New infrastructure:
+`cycle_now()`, `wait_value_cycle()`, per-beat cycle recording in the shim, and
+`measure_d_wr()` / `measure_d_wr_falling()` in `tb_common.py`.
+
+---
+
 ## 7. Status as of this plan
 
 `make -C tb lint` — clean (Verilator 5.032 `--lint-only -Wall`, 0 warnings; 5/5
 structural checks pass).
-`make -C tb test` — **65 / 65 pass** at N=8 with `SEED=1` and `SEED=12345`.
-`make -C tb test N=4 TEST=test_matmul` — 16/16 pass.
-`make -C tb test N=16 TEST=test_smoke` — 4/4 pass.
-`make -C tb elab-sweep` — passes for N ∈ {2,4,8,16,32}.
+`make -C tb test` — **71 / 71 pass** at N=8, on `SEED=1` and `SEED=12345`.
+`make -C tb test N=4` / `N=16` — pass.
+`make -C tb elab-sweep` — passes for N in {2,4,8,16,32}.
 Fail-ability confirmed: breaking the expected `ID` value in `test_smoke.py`
-produced `TESTS=4 PASS=3 FAIL=1`; the value was restored and re-verified.
+produced `TESTS=4 PASS=3 FAIL=1`; the value was restored and re-verified. The
+REQ-123 test also demonstrated its own fail-ability for real — written to the
+v1.1.0 formula it failed by exactly one cycle, which is the defect v1.1.1 fixed.

@@ -28,7 +28,11 @@
 //          irq follows IRQ_STATUS with one cycle of latency (REQ-081 allows 2).
 //
 // Implements: REQ-012, REQ-064, REQ-065 ... REQ-084, REQ-101 ... REQ-104,
-//             REQ-111, REQ-114.
+//             REQ-111, REQ-114,
+//             REQ-124 (a CTRL write with both bit 1 and bit 0 set drives
+//             soft_reset only: `start` is qualified with !h_wdata[1] and so is
+//             `start_while_busy`, so ERR_START_BUSY is never set, and the
+//             soft_reset clause clears it in the same cycle regardless).
 // ---------------------------------------------------------------------------
 module reg_file #(
     parameter int N    = 8,

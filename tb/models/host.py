@@ -18,6 +18,7 @@ import random
 
 import cocotb
 from cocotb.clock import Clock
+from cocotb.utils import get_sim_time
 from cocotb.queue import QueueEmpty
 from cocotb.triggers import (ClockCycles, RisingEdge, SimTimeoutError,
                              with_timeout)
@@ -54,6 +55,46 @@ def get_seed():
 
 class TbTimeout(AssertionError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Exact cycle accounting (spec 9.6 / REQ-122 / REQ-123)
+#
+# Cycle numbering convention, used consistently by the shim and by the tests:
+#
+#   * cycle `k` is the interval between rising edge `k` and rising edge `k+1`;
+#     rising edge `k` happens at sim time `k * CLK_PERIOD_NS`.
+#   * "signal X holds value V during cycle k" means X took V at edge k.
+#   * a stream beat "transfers on cycle k" (the spec 9.6 wording) when
+#     `valid` and `ready` are both 1 *during* cycle k; the data is captured by
+#     the flop at edge k+1.
+#
+# `cycle_now()` is derived from sim time rather than from a counting task, so
+# it is immune to task-ordering races at a clock edge.  Immediately after
+# `await RisingEdge(clk)` it returns the index of the edge just taken, and the
+# values read at that point are the ones that held during the *previous*
+# cycle -- hence the `- 1` in the helpers below.
+# ---------------------------------------------------------------------------
+
+def cycle_now():
+    return int(round(get_sim_time("ns") / CLK_PERIOD_NS))
+
+
+async def wait_value_cycle(clk, sig, value, name, limit):
+    """Wait for `sig` to hold `value`; return the cycle during which it did.
+
+    Fails with a message naming the signal rather than hanging.
+    """
+    for _ in range(limit):
+        await RisingEdge(clk)
+        try:
+            if int(sig.value) == value:
+                return cycle_now() - 1
+        except Exception:
+            continue
+    raise TbTimeout(
+        f"timeout after {limit} clock cycles waiting for {name} == {value} "
+        f"(last observed {sig.value!r})")
 
 
 async def wait_for(sig, value, name, cycles, clk):
