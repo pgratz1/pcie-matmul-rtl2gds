@@ -409,8 +409,16 @@ with a genuine rebuild (BUG-001 fixed):
 | 8 | 72/72 | 72/72 | `0f7196821ba8dfbfde0fad0e88a864aa` |
 | 16 | 72/72 | 72/72 | `63f5e516913028cd564418d683bc020e` |
 
-The four hashes are distinct, which is the direct evidence that each `N` now
-builds and runs its own binary. `N = 32` was **not run**: a single pass is
+Each `N` builds into its own `sim_build/icarus-n<N>/` directory. **Caveat on
+the hashes:** `iverilog` output is not byte-reproducible — two rebuilds of the
+identical source at the identical `N` give different hashes — so *distinct*
+hashes across `N` do not by themselves prove a genuine per-`N` build. (The
+converse is sound, which is why BUG-001's original evidence held: *identical*
+output from a non-reproducible compiler does prove no recompile happened.) The
+real evidence that each run used its own binary is behavioural: REQ-123
+measures `DONE` at exactly `t_beat + 4N + 2` — 10 at N=2, 18 at N=4, 34 at N=8,
+66 at N=16 — and the two tests that BUG-001 had been hiding (BUG-002, BUG-003)
+now fail-then-pass only against a real N=2 build. `N = 32` was **not run**: a single pass is
 estimated at 6–8 h under Icarus. Its elaboration is covered by
 `make -C tb elab-sweep`, and `test_matmul_c_addressing_and_persistence`'s
 operand patterns were chosen to stay INT8-legal and permutation-sensitive at

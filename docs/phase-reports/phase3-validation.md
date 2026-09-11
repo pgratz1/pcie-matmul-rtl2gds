@@ -1,7 +1,8 @@
 # Phase 3 — Validation report
 
 **Owner:** validation-specialist
-**Date:** 2026-09-10
+**Date:** 2026-09-10, re-verified and closed 2026-09-11
+**Status:** **GATE MET** (see §1b for the close-out pass)
 **Design under test:** `rtl/` against `docs/spec.md` v1.1.3 and
 `docs/register-map.md` v1.1.3
 **Simulator:** Icarus Verilog 12.0 + cocotb 2.1.0 (DEC-001);
@@ -12,7 +13,11 @@ Verilator 5.032 as linter only
 
 ---
 
-## 1. Gate status, item by item
+## 1. Gate status as first assessed, 2026-09-10 (superseded by §1b)
+
+> This section records the gate as it stood when the six bugs were still open.
+> It is kept because the reasoning behind each bug lives here. **For the final
+> gate status see §1b.**
 
 | # | Gate criterion (CLAUDE.md) | Status |
 |---|---|---|
@@ -25,6 +30,90 @@ this phase lives in the testbench or in the specification. That is a genuinely
 good result for `rtl/`, and it is also why items 1 and 2 are held open: the
 *evidence* behind the previously-reported "71/71 green" was not what it
 appeared to be (BUG-001).
+
+---
+
+## 1b. Close-out pass — 2026-09-11 (gate MET)
+
+All six bugs were fixed by their owners and have been **independently
+re-verified and closed**. `rtl/` was never modified at any point in Phase 3.
+
+| # | Gate criterion | Status |
+|---|---|---|
+| 1 | 100% of the tests in `tb/TESTPLAN.md` pass | **MET** — 72/72 at `N` = 2, 4, 8 (3 seeds each) and `N` = 16 (2 seeds). `N` = 32 out of scope, not run (§7) |
+| 2 | Every bug in `docs/bugs.md` closed | **MET** — 6 of 6 `CLOSED`, each with an independent verification record |
+| 3 | Yosys `read_verilog -sv rtl/*.sv; synth` | **MET** — exit 0, `Found and reported 0 problems.` |
+
+The suite grew from 71 to 72 tests: `test_tlp_over_length_memory_request` was
+added for the new REQ-127. All **127** requirements in spec v1.1.4 are mapped in
+`tb/TESTPLAN.md`; the set difference between the REQ ids in `docs/spec.md` and
+those in `tb/TESTPLAN.md` is empty.
+
+### How the fixes were verified — mutation testing
+
+Three of the six bugs (002, 003, 005) were "a test assumed `N` = 8
+magnitudes". For those, **a passing test is not evidence**: the repair could
+have made the test pass by checking less, which would be worse than the
+original bug. So each repaired test was run against deliberately broken RTL and
+**required to fail**. Eight lint-clean mutants were injected into a scratch copy
+of `rtl/` (never into `rtl/` itself):
+
+| Mutant | Injected defect | Target test | Result |
+|---|---|---|---|
+| M1 | `!eng_busy` dropped from `a_wr`/`b_wr`/`c_wr` | `test_matmul_write_abc_while_busy` | killed at `N` = 2, 8 |
+| M2 | drain rows emitted in reverse (`c_wr_row = drn_cnt`) | `test_matmul_c_addressing_and_persistence` | killed at `N` = 2, 8 |
+| M3 | drain lanes reversed in `mem_c` | `test_matmul_c_addressing_and_persistence` | killed at `N` = 2, 8 |
+| M4 | back-to-back BAR0 write beat dropped | `test_tlp_back_to_back...` | **survived — invalid mutant** (unreachable for single-DWORD TLPs, whose payload beats are 3 header beats apart). Explained, not ignored |
+| M5 | `sop` one cycle after `eop` ignored (gapless misframing) | `test_tlp_back_to_back...` | killed at `N` = 2, 8 |
+| M6 | `rx_tlp_ready` low 40 cycles after every `eop` | `test_matmul_write_abc_while_busy` | killed at `N` = 2, 8 — **fires the new positioning guard** |
+| M7 | `len_ok` accepts `Length` field 0 | `test_tlp_over_length_memory_request` | killed |
+| M8 | `len_ok` accepts decoded length > 32 | `test_tlp_over_length_memory_request` | killed |
+
+**M6 is the one that matters most.** My BUG-003 diagnosis was that the test
+*silently tested nothing* once the operation had already finished — a failure
+mode no passing run can disprove. M6 forces exactly that situation (it stalls
+`rx_tlp_ready` after each `eop`, which is legal under REQ-002, pushing the
+poison write's beat past the BUSY window). The repaired test failed with
+`test positioning: the mem_a write's payload beat transferred 45 cycles after
+the CTRL.START beat, outside the BUSY window [1, 4*N+2 = 10]`. The degenerate
+case is now a loud, self-explaining failure instead of a green tick.
+
+### BUG-001's guard, attacked
+
+`check-build-id` was attacked with seven `SIM_BUILD` overrides. Every value that
+fails to encode `N` was blocked; the only two accepted both encode `N`
+correctly. The `*n$(N)` suffix glob cannot be defeated by the legal `N` values —
+none of `n2, n4, n8, n16, n32` is a suffix of another. Functionally, deleting
+`tb/sim_build` and running `N` = 2, 4, 8, 16 with **no `make clean`** produced
+four distinct `sim.vvp` hashes (`688715e0…`, `b3a59481…`, `0f719682…`,
+`63f5e516…`) and four isolated `results.xml`.
+
+**One residual hole, reported not reopened:** `check-build-id` guards
+`sim-guard` (hence `test` and `waves`) but **not** `sim`, the target cocotb's
+`Makefile.sim` contributes. `make -C tb sim SIM_BUILD=/tmp/bypass-nope` runs
+unguarded — confirmed empirically. `sim` is not a documented entry point and the
+default `SIM_BUILD` still encodes `N` there, so this is narrow. Suggested
+one-line follow-up for test-writer: `sim: check-build-id`.
+
+### Negative results re-confirmed
+
+All 18 scratchpad probes from the original pass were re-run unmodified against
+the updated tree: **18/18 at `N` = 2 and `N` = 8**, including
+`p_heavy_random_backpressure` at `N` = 16, which is the artifact that originally
+exposed BUG-006 and now passes untouched. §5 below is unchanged and stands.
+
+### Close-out results
+
+| `N` | seeds | result | wall / run |
+|---|---|---|---|
+| 2 | 1, 424242, 77 | **72/72** ×3 | 14–20 s |
+| 4 | 1, 424242, 77 | **72/72** ×3 | 16–20 s |
+| 8 | 1, 424242, 77 | **72/72** ×3 | 31–47 s |
+| 16 | 1, 424242 | **72/72** ×2 | ~34 min |
+| 32 | — | **not run, out of scope** | see §7 |
+
+Run from a deleted `tb/sim_build`, so every binary was built fresh; the four
+`N` streams ran in parallel, seeds serially within each stream.
 
 ---
 
@@ -93,6 +182,9 @@ Seeds 1, 7, 424242, 20260910. `N` = 2, 4, 8, 16, 32.
 | 16 | 70/71 | 70/71 | 70/71 | 70/71 | ~20 min |
 | 32 | 14/71 then aborted | — | — | — | **> 80 min for 15 tests** |
 
+*(All of the above is the pre-fix picture. Post-fix results are in §1b:
+72/72 everywhere.)*
+
 Two further confirmation runs at seeds **555** and **987654321**, `N` = 8,
 clean build, dedicated `SIM_BUILD`: **71/71 both**.
 
@@ -136,8 +228,11 @@ Full entries with evidence in `docs/bugs.md`.
 | BUG-005 | `test_matmul_c_addressing_and_persistence` builds `A[i][j] = i*N + j - 100`, which leaves INT8 range at `N` >= 16 (max 155 at `N` = 16, 923 at `N` = 32); the golden model rejects the stimulus before the DUT sees it | test-writer | `ROUTED-test` |
 | BUG-006 | `Host.OP_TIMEOUT_NS` is a fixed 20 us covering a whole multi-completion region read; at `N` = 16 under heavy backpressure a full-C readback cannot finish inside it. Latent flake at `N` = 32 | test-writer | `ROUTED-test` |
 
-**Zero RTL changes were made in Phase 3.** `rtl/` is byte-identical to what
-rtl-reviewer signed off in `phase2-review-round2.md`.
+**Zero RTL changes were made in Phase 3**, by me or by anyone else, including
+during the fix round. `rtl/` is byte-identical to what rtl-reviewer signed off
+in `phase2-review-round2.md` — confirmed with `git diff --stat rtl/` returning
+empty at close-out. Every one of the six bugs lived in `tb/` or in
+`docs/spec.md`.
 
 BUG-005 is the direct consequence of BUG-001: it is a deterministic,
 seed-independent failure that has been sitting in the suite since the test was

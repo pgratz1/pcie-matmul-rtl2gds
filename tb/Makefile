@@ -171,6 +171,21 @@ sim-guard: check-build-id
 ifneq ($(strip $(VERILOG_SOURCES)),)
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
+# Close BUG-001 on *every* path, not just the ones this Makefile defines.
+# cocotb contributes four more entry points that reach a build without going
+# through `sim-guard`: `sim`, `regression`, `all` and `debug`.  Rather than
+# chase each one (and miss the next one cocotb adds), the guard is attached to
+# the two file targets every path must funnel through -- the compiled binary
+# and the results file.
+#
+# The prerequisite is **order-only** (`|`).  `check-build-id` is .PHONY, so a
+# normal prerequisite would mark sim.vvp perpetually out of date and force a
+# full iverilog recompile on every invocation, which costs real time at large
+# N.  An order-only phony prerequisite still runs the check but does not make
+# the target stale.
+$(SIM_BUILD)/sim.vvp: | check-build-id
+$(COCOTB_RESULTS_FILE): | check-build-id
+
 test: sim-guard
 	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) sim
 else
