@@ -80,16 +80,39 @@ module mem_a #(
     end
 
     // ---- engine read ports ----------------------------------------------
-    localparam int BOW = $clog2(MEMBITS);   // bit-offset width into mem
+    // IMPLEMENTATION NOTE (BUG-007). The previous form computed a variable bit
+    // offset with a non-zero constant base,
+    //     boff = BOW'(<const>) + (BOW'(idx) << 3);  byte_sel = mem[boff +: 8];
+    // which Yosys lowers to a $shiftx and then rewrites in `peepopt`'s
+    // shiftpow2 peephole. That rewrite silently dropped whole read ports for
+    // some constant bases (port 6 at N=8, ports 12-13 at N=16, ports 24-27 at
+    // N=32), producing a netlist that computed those rows of C as zero while
+    // RTL simulation was correct. Every part-select base below is a
+    // compile-time constant and the operand choice is an explicit N-way mux, so
+    // no $shiftx is created and the peephole cannot fire.
 
-    genvar gi;
+    genvar gi, gk;
     generate
         for (gi = 0; gi < N; gi = gi + 1) begin : g_rd
-            logic [BOW-1:0] boff;
-            logic [DW-1:0]  byte_sel;
-            // byte index (gi*N + e_idx[gi]) -> bit offset * 8
-            assign boff     = BOW'(gi*N*8) + (BOW'(e_idx[gi*IDXW +: IDXW]) << 3);
-            assign byte_sel = mem[boff +: 8];
+            logic [IDXW-1:0] idx;
+            logic [N*DW-1:0] cand;      // the N candidate bytes A[gi][0..N-1]
+            logic [DW-1:0]   byte_sel;
+            integer          kk;
+
+            assign idx = e_idx[gi*IDXW +: IDXW];
+
+            for (gk = 0; gk < N; gk = gk + 1) begin : g_cand
+                assign cand[gk*DW +: DW] = mem[(gi*N + gk)*DW +: DW];
+            end
+
+            always_comb begin
+                byte_sel = {DW{1'b0}};
+                for (kk = 0; kk < N; kk = kk + 1) begin
+                    if (idx == IDXW'(kk)) begin
+                        byte_sel = cand[kk*DW +: DW];
+                    end
+                end
+            end
 
             always_ff @(posedge clk) begin
                 if (rst) begin

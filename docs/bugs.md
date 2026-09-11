@@ -491,3 +491,190 @@ The probe was not edited in any way between the failing and passing runs, so the
 change in outcome is attributable to the harness fix alone.
 
 **Closed.**
+---
+
+## BUG-007 — PE row 6's `a_reg` is absent from the synthesized netlist; C row 6 is always zero
+
+| field | value |
+|---|---|
+| **test** | `test_regs::test_reg_soft_reset`, `test_regs::test_reg_start_and_soft_reset_while_busy` (gate-level); scratchpad probes `p_gl_ab_readback_then_matmul`, `p_gl_drain_vs_compute` |
+| **REQ ids** | REQ-105 (C = A×B), REQ-089/REQ-098 (drain), REQ-085/REQ-086 (`mem_a` operand delivery) |
+| **status** | **`CLOSED` 2026-09-11** (was `ROUTED-circuit-designer`; re-routed to rtl-designer once the cause was found to be a Yosys `peepopt` mis-transformation of legal RTL) |
+| **found by** | Phase 4 gate-level simulation of `results/sky130hd/pcie_matmul/base/6_final.v`. |
+
+**Symptom.** At gate level, a matrix multiply returns the correct product in
+every row of C except **row 6**, which is all zeros. Deterministic: reproduced
+on 3 independent random operand pairs, at two different seeds, **both with and
+without SDF back-annotation**. The same tests pass at RTL (the RTL suite is
+72/72 at N=8).
+
+```
+AssertionError: C before SOFT_RESET: 8 of 64 elements differ (REQ-105).
+    [6][0]: DUT 0 != golden -12
+    [6][1]: DUT 0 != golden -4
+    ... rows 0-5 and 7 all exactly correct ...
+```
+
+**Triage, in order.**
+
+1. **Not the host write path.** `mem_a` and `mem_b` were read back byte-for-byte
+   before `CTRL.START`: `A readback: 0/64 bytes wrong`, `B readback: 0/64 bytes
+   wrong`. The operands are in the device.
+2. **Not a lost drain write.** Every C word was pre-loaded with a sentinel
+   before the operation. After the operation row 6 contained **zeros, not the
+   sentinel** — so the drain write for row 6 *did* fire, and what it wrote was
+   zero. The accumulators in PE row 6 were zero at drain time.
+3. **Not SDF / timing.** Identical failure with `+sdf=` and with no
+   back-annotation at all. Icarus implements no timing checks in any case.
+4. **Not X-propagation.** The residual X in the netlist is 256 anonymous
+   internal nets of the 64 adder macros, static and never reaching a flop or an
+   output (see the Phase 4 report). C row 6 reads a clean 0, not X.
+
+**Root cause, localized.** The A-operand pipeline register of every PE in row 6
+does not exist in the netlist. A static census of instance names:
+
+| row | `a_reg` nets | PE flop instances | surviving PE signals |
+|---|---|---|---|
+| 0–5 | 56 each | 383 each | `acc_reg a_reg b_reg prod v_in v_out v_reg` |
+| **6** | **0** | 327 | `acc_reg b_reg prod v_in v_out v_reg` — **no `a_reg`** |
+| 7 | 56 | 319 | `acc_reg a_reg prod v_in v_out v_reg` |
+
+With no `a_reg`, row 6 never receives an A operand, every product is 0, the
+accumulators stay 0, and the drain faithfully writes zeros.
+
+(Row 7's lower flop count is *not* the defect: the east-edge `a_out`/`v_out` of
+the last column legitimately has no consumer, which `rtl/README.md` already
+documents as one of the three `UNUSEDSIGNAL` suppressions. Row 7 computes
+correctly.)
+
+**Introduced by synthesis, not by place-and-route.** The same census on
+`results/sky130hd/pcie_matmul/base/1_2_yosys.v` — the Yosys output, before
+floorplan — already shows `g_row[6]` with **0** `a_reg` nets while all seven
+other rows have 56. The defect exists at the synthesis boundary. P&R faithfully
+implemented what it was given.
+
+**Why 71 RTL tests and the Phase 4 smoke test all missed it.** `test_smoke_single_multiply`
+sets exactly one non-zero operand, `A[0][0]=7`, `B[0][0]=6`, so every element of
+C except `C[0][0]` is *expected* to be zero. A permanently-zero row 6 is
+indistinguishable from a correct result. **The Phase 4 gate's floor — "at least
+the smoke test" — passes on this netlist.** That is the finding behind the
+finding: the gate as written would have signed off a chip that computes the
+wrong answer for 1/8 of every matrix.
+
+**Recommended next step (circuit-designer / rtl-designer, not validation).**
+Reproduce at the Yosys stage alone and bisect the synthesis script — start by
+checking whether `a_reg` in row 6 is being removed by an optimization pass that
+mis-identifies it as unloaded, since row 6 is adjacent to row 7 whose `a_out`
+genuinely *is* unloaded. That adjacency is the obvious suspect and it is
+testable in minutes with `yosys -p "... ; select -count g_row[6]"`. `rtl/` needs
+no change unless that investigation shows otherwise.
+
+**Files.** `results/sky130hd/pcie_matmul/base/1_2_yosys.v` (first appearance),
+`6_final.v`; `rtl/mm_array.sv`, `rtl/mm_pe.sv` for reference only.
+
+
+### BUG-007 close-out verification (validation-specialist, 2026-09-11)
+
+**What the cause actually was.** Not P&R, and not the drain logic I suspected
+from the symptom. Yosys lowers a variable bit-offset with a **non-zero constant
+base** — `boff = BOW'(gi*N*8) + (BOW'(idx) << 3)` in the old `mem_a.sv:91` — to
+a `$shiftx`, and `peepopt`'s `shiftpow2` peephole then rewrites it incorrectly.
+The arithmetic was in range (max 504 of 512). **The RTL was legal; the tool was
+wrong.** Fixed by selecting the operand byte with an explicit N-way mux over
+constant-base slices, in `mem_a.sv` and `mem_b.sv`.
+
+**Pre-fix exposure was wider than the symptom I reported**: `mem_a` lost port 6
+at `N`=8, ports 12–13 at `N`=16, ports 24–27 at `N`=32; `N`=2 and 4 were clean.
+It worsens with `N`.
+
+#### 1. Negative control — confirmed independently, not taken on report
+
+I rebuilt the pre-fix RTL from `git show HEAD:rtl/<file>` (verified pre-fix:
+`mem_a.sv:91` still carries the old `boff` expression), synthesized it, and
+replayed the suite against the **synthesized netlist**:
+
+```
+pre-fix,  post-synth, N=8:  TESTS=17 PASS=5  FAIL=12   (test_matmul)
+post-fix, post-synth, N=8:  TESTS=72 PASS=72 FAIL=0    (whole suite)
+```
+
+Every single one of the **80** element mismatches in the negative control is in
+**row 6**, all `DUT 0`:
+
+```
+[6][0]: DUT 0 != golden 127   [6][4]: DUT 0 != golden -4
+[6][1]: DUT 0 != golden 73    [6][5]: DUT 0 != golden 78
+...                            [6][7]: DUT 0 != golden -40
+row index histogram of all diffs:  80 x [6][
+```
+
+This is the same signature I measured on `6_final.v` during the Phase 4 gate-level
+run, reproduced from source through an independent synthesis. The control is real.
+
+#### 2. Formal equivalence on the three surviving `$shiftx` sites
+
+`peepopt`/`shiftpow2` **still fires three times at every `N`** after the fix —
+the fix removed the *mis-transformed* site, not the peephole. The three
+survivors are the host read ports `mem_a.sv:63`, `mem_b.sv:63`, `mem_c.sv:67`,
+all of which have a **zero** constant base. Rather than argue from that
+difference, I proved it:
+
+```
+yosys -p "read_verilog -sv rtl/<m>.sv; chparam -set N <n> <m>;
+          hierarchy -top <m>; proc; opt_expr; equiv_opt -assert peepopt"
+```
+
+| module | N=8 | N=16 |
+|---|---|---|
+| `mem_a` | Equivalence successfully proven | Equivalence successfully proven |
+| `mem_b` | Equivalence successfully proven | Equivalence successfully proven |
+| `mem_c` | Equivalence successfully proven | Equivalence successfully proven (68 min of SAT — the N=16 host port is a 256-way shifter) |
+
+**One thing that looked alarming and is not.** The `peepopt` log reports
+`mem_b.sv:63` with `index=\u_app_bar0.u_mem_a.h_sel` — mem_b's shifter indexed
+by *mem_a's* select. That is `opt_merge` CSE after flattening: both modules
+compute `h_sel` as the identical function of the identical `h_dw_addr`, so
+Yosys keeps one wire and names it after the first. `mem_c` has a different word
+count, so its compare differs and it keeps its own. The `equiv_opt` proofs above
+are what settle it; the log line alone would not.
+
+#### 3. Design-wide sweep for the *pattern* (the item I was asked to prioritize)
+
+Every indexed part-select (`+:` / `-:`) in all 14 modules, classified by whether
+its base is a compile-time constant:
+
+| Site | Base | Verdict |
+|---|---|---|
+| `mm_array.sv` ×8, `mm_ctrl.sv` ×2, `mem_a/b.sv` ×6 each, `mem_c.sv:73-74` | genvar / static-loop integer | constant — cannot produce `$shiftx` |
+| `mem_c.sv:98` (`ri * BOW'(N*ACCW)`) | integer in a **static** `for` — unrolls | constant |
+| **`mem_c.sv:67`, `:103`** (`mem[h_boff +: 32]`, `h_boff = h_sel * ACCW`) | **variable**, zero constant base | proven equivalent under `peepopt` |
+| **`mem_c.sv:101`** (`mem[d_boff +: N*ACCW]`, `d_boff = d_row * N*ACCW`) | **variable**, zero constant base | proven equivalent under `peepopt` |
+
+**No other instance of the BUG-007 shape (variable offset + non-zero constant
+base) exists anywhere in `rtl/`.** The only variable-base selects left are the
+three `mem_c` sites, all zero-base, all covered by the proofs above.
+
+#### 4. The check that would have caught this in minutes — now a reusable tool
+
+Lint was clean, `yosys check` reported 0 problems, and 72 RTL tests passed, and
+the design was still wrong. The only thing that detects this class is simulating
+the **post-synthesis netlist**, and that needs no PDK: `synth -flatten` leaves
+Yosys's own `$_AND_`/`$_DFF_P_` cells, and Yosys ships `simcells.v` defining
+them, so Icarus runs the netlist directly.
+
+`tb/gl/postsyn_replay.sh <N> [rtl-dir] [modules]` does this in ~4 minutes at
+`N`=8 against a 2-hour ORFS flow. Results on the fixed RTL:
+
+| `N` | post-synth replay |
+|---|---|
+| 2 | **72/72** |
+| 4 | **72/72** |
+| 8 | **72/72** |
+| 16 | **72/72** — and `N`=16 is a configuration that was *broken* pre-fix (`mem_a` lost ports 12–13), so this is the strongest single result in the close-out |
+
+**Recommendation to the orchestrator:** make this a standing gate between
+Phase 3 and Phase 4. It is cheap, it is PDK-free, and it is the only barrier
+this project has against a correct-simulating / wrong-synthesizing design.
+
+**Files.** `rtl/mem_a.sv`, `rtl/mem_b.sv` (rtl-designer's fix);
+`tb/gl/postsyn_replay.sh`, `tb/gl/postsyn_timescale.v` (my harness).

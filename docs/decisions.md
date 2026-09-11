@@ -335,3 +335,91 @@ after Phase 4, DEC-007 and DEC-008 must both be reopened.
 **OQ-004 — Gate-level simulation needs sky130 cell models that are not on this
 machine** (Phase 0 report §6, carried-forward item 3). Not a spec issue, but it gates
 the Phase 4 exit criterion, so someone has to fetch them before Phase 4.
+
+---
+
+## 2026-09-11 — Phase 4 physical design (circuit-designer)
+
+**DEC-014 — Keep A/B/C as flip-flops; no memory macro, no shrink of `N`.**
+The Phase 4 brief requires a decision, before place-and-route, on whether the
+Yosys-inferred flop register files are affordable on this platform. Measured at
+`N = 8` on sky130hd from `reports/sky130hd/pcie_matmul/base/synth_stat.txt`:
+
+| Metric | Value |
+|--------|-------|
+| Mapped standard cells | 53,880 |
+| `sky130_fd_sc_hd__dfxtp_1` (all storage, incl. A/B/C/PE accumulators) | 6,616 |
+| Cell area | 518,645 um^2 |
+| of which sequential | 132,447 um^2 (25.5%) |
+
+This is affordable: it is the same order as ORFS's own sky130hd `aes` and `jpeg`
+designs, which route on this platform. Sequential logic is only a quarter of the
+area, so a memory macro would recover at most ~25% of the die while (a) breaking
+DEC-010, (b) breaking the `D_WR = 1` write latency of REQ-122, which no
+single-cycle-write SRAM in `platforms/sky130ram` supports for the byte-enabled
+`N`-port read pattern `mem_a`/`mem_b` need, and (c) invalidating 72 passing
+Phase 3 tests. Options (a) shrink `N` and (c) ask for a narrower array are
+therefore both rejected as unnecessary, and option (b) a platform macro is
+rejected as incompatible with the validated interface contract.
+**Consequence:** the binding difficulty in Phase 4 is routing congestion, not
+area. `flow/config.mk` sets `CORE_UTILIZATION = 35` (not the platform default
+implied ~50-60%) for that reason, matching what ORFS uses for its own
+congestion-limited sky130hd design, `aes`.
+
+This resolves the area half of **OQ-002**: the real cell area is 0.52 mm^2,
+about 1.5x the 0.35 mm^2 estimate, and at 35% utilization the core is ~1.22 mm
+on a side. That is large but not unworkable, so `sky130hd` is retained and the
+`nangate45` fallback in OQ-002 is **not** invoked.
+
+**DEC-015 — I/O timing budget at the TLP boundary: 40% of the clock period.**
+The spec fixes no external timing budget for the `rx_tlp_*` / `tx_tlp_*` / `irq`
+boundary, so one had to be assumed. `flow/constraint.sdc` sets
+`set_input_delay` and `set_output_delay` to `0.40 * clk_period` = 4.000 ns,
+per the circuit-designer brief's default. This is deliberately pessimistic
+relative to the 20% that every ORFS sky130hd example design uses, and it leaves
+6.0 ns for the pin-to-flop TLP classifier (`tlp_rx.sv:200-222`, the Phase 2b
+reviewer's predicted path #5). If a boundary path turns out to be the binding
+constraint, relaxing this number to the ORFS-conventional 20% is the first
+move, and it will be recorded here with the before/after slack.
+
+**OQ-004 is now actionable, not just open.** Confirmed by direct search: no
+sky130 PDK, no `sky130_fd_sc_hd.v`, no `volare` and no `magic` exist anywhere on
+this machine, and ORFS's `platforms/sky130hd/` ships only the three Yosys
+*mapping* files (`cells_adders_hd.v`, `cells_clkgate_hd.v`,
+`cells_latch_hd.v`), which are not simulation models. Network access to GitHub
+is available and `github.com/google/skywater-pdk-libs-sky130_fd_sc_hd` (branch
+`main`) carries per-cell `.v` with `specify` blocks, which is what Icarus needs
+for SDF back-annotation. `flow/make_gl_models.sh` fetches exactly the cells the
+final netlist instantiates. The Phase 4 gate-level simulation is therefore
+unblocked, but it depends on network access at that moment.
+
+**DEC-016 — 100 MHz closed; the DEC-009 relaxation ladder is NOT invoked.**
+Measured post-route on sky130hd at `N = 8`, typical corner, 10.000 ns:
+setup violation count **0**, hold violation count **0**, WNS/TNS **0.00/0.00**,
+worst setup slack **+0.30 ns**, worst hold slack **+0.42 ns**. Reg-to-reg
+`period_min` is 8.20 ns (fmax 121.98 MHz), so the PE MAC — the path §13.2
+predicted would be critical — finishes with **+1.80 ns** of slack and is not the
+binding constraint. **OQ-001 is closed: yes, 100 MHz closes.** No clock number
+changes anywhere; spec §13.2 stands as written. Zero of the four permitted
+closure iterations were used.
+
+For the record, the number that *would* have moved first if it had not closed:
+the binding path is `rst` (input pin) -> 3 levels of logic -> `tx_tlp_data[20]`
+(output pin), of which only 1.69 ns is silicon and 8.00 ns is the DEC-015 I/O
+budget. Relaxing DEC-015 from 40% to the ORFS-conventional 20% would take that
+path from +0.30 ns to roughly +4.30 ns and leave the design PE-limited at
+~122 MHz. It was not needed, so it was not done.
+
+**DEC-017 — One residual antenna violation accepted for v1.**
+`check_antennas` on `6_final.odb` reports one violating net, `net2802` into
+`u_app_bar0.u_mem_b.e_rdata[58]/D`: met5 side-area ratio 16988.95 against a
+10781.00 limit. ORFS's diode-repair loop hit its iteration cap and oscillated
+8 -> 1 -> 2 -> 1 without clearing it, after inserting 242 diodes.
+Before: 8 antenna violations. After: 1.
+Neither ORFS DRC checker counts it — the detailed router reports 0 and the
+sky130hd KLayout sign-off deck reports 0, and neither deck contains antenna
+rules — so the Phase 4 gate's "zero DRC violations" criterion is met as written.
+Accepted rather than fixed because the only remedy is raising
+`MAX_REPAIR_ANTENNAS_ITER_DRT` and re-routing, which costs ~97 minutes for one
+net out of 76,784 instances. Recorded here so it is not rediscovered as a
+surprise: a real tapeout would have to clear it.

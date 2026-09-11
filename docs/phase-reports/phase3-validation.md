@@ -425,3 +425,81 @@ regressions cheap. That is an orchestrator/human decision, not mine.
 5. Phase 4 proceeds in parallel with 1–3; none of these six bugs touches
    `rtl/`, so nothing blocks the circuit-designer.
 
+
+---
+
+## 9. BUG-007 regression round — 2026-09-11
+
+`rtl/mem_a.sv` and `rtl/mem_b.sv` were restructured (explicit N-way operand mux
+replacing a variable bit-offset) to work around a Yosys `peepopt`/`shiftpow2`
+mis-transformation. The operand read path is structurally different, so this was
+re-run as a real regression, not a formality.
+
+### RTL suite — genuine per-`N` rebuilds, fresh `tb/sim_build`
+
+| `N` | SEED 1 | SEED 424242 | wall / run |
+|---|---|---|---|
+| 2 | **72/72** | **72/72** | 10–14 s |
+| 4 | **72/72** | **72/72** | 11–15 s |
+| 8 | **72/72** | **72/72** | 31–34 s |
+| 16 | **72/72** | **72/72** | ~48 min |
+
+### The 18 negative probes — re-run unmodified
+
+**18/18 at `N` = 2 and `N` = 8.** Reset behaviour, backpressure, framing,
+boundary arithmetic and X-propagation are all undisturbed by the rewrite. The
+PE scan by explicit hierarchy path (the corrected method from the Phase 4 work,
+not the under-sampling walk) again reports **64 PEs visited, zero X**.
+
+### New standing capability: post-synthesis replay
+
+BUG-007 passed `verilator --lint-only -Wall`, passed `yosys check` with 0
+problems, and passed 72 RTL tests, and the netlist was still wrong. The only
+check that detects this class is simulating the **post-synthesis** netlist, and
+it needs no PDK: `synth -flatten` leaves Yosys's own `$_AND_`/`$_DFF_P_` cells
+and Yosys ships `simcells.v` defining them, so Icarus runs the netlist directly.
+
+`tb/gl/postsyn_replay.sh <N> [rtl-dir] [modules]` — ~4 min at `N` = 8 against
+the ~2 h an ORFS flow costs.
+
+| `N` | post-synthesis replay, fixed RTL |
+|---|---|
+| 2 | **72/72** |
+| 4 | **72/72** |
+| 8 | **72/72** |
+| 16 | **72/72** (broken pre-fix — `mem_a` lost ports 12–13) |
+
+**Negative control, built and run by me rather than taken on report:** the
+pre-fix RTL reconstructed from `git show HEAD:rtl/<file>`, synthesized, replayed
+→ `TESTS=17 PASS=5 FAIL=12`, with **all 80** element mismatches in **row 6**,
+every one `DUT 0`. Same signature as the Phase 4 gate-level measurement,
+reproduced from source through an independent synthesis.
+
+**Recommendation:** make `postsyn_replay.sh` a standing gate between Phase 3 and
+Phase 4. It is the project's only barrier against a correct-simulating /
+wrong-synthesizing design, and it is cheap.
+
+### Design-wide sweep for the bug *pattern* (`+:`/`-:` with a variable base)
+
+All 14 modules audited. Every part-select with a genvar or static-loop base is a
+compile-time constant and cannot produce a `$shiftx`. **The only variable-base
+selects left in the whole tree are three sites in `mem_c.sv` (lines 67, 101,
+103), and all three have a *zero* constant base** — not the non-zero-base shape
+that triggered BUG-007.
+
+`peepopt`/`shiftpow2` still fires 3× at every `N` after the fix (on the host
+read ports of `mem_a`, `mem_b`, `mem_c`), so rather than argue from the shape
+difference I proved it with `equiv_opt -assert peepopt`:
+
+| module | N=8 | N=16 |
+|---|---|---|
+| `mem_a` | proven | proven |
+| `mem_b` | proven | proven |
+| `mem_c` | proven | proven (68 min SAT) |
+
+One log line looks alarming and is not: `mem_b.sv:63` is reported with
+`index=u_mem_a.h_sel`. That is `opt_merge` CSE after flattening — both modules
+compute the identical function of the identical `h_dw_addr`. The proofs, not the
+log, are what settle it.
+
+**Conclusion: no second instance of the BUG-007 pattern exists in `rtl/`.**
