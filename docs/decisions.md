@@ -423,3 +423,50 @@ Accepted rather than fixed because the only remedy is raising
 `MAX_REPAIR_ANTENNAS_ITER_DRT` and re-routing, which costs ~97 minutes for one
 net out of 76,784 instances. Recorded here so it is not rediscovered as a
 surprise: a real tapeout would have to clear it.
+
+**DEC-018 — Re-ran the full flow on the BUG-007-fixed RTL; no config change, no
+clock relaxation, DEC-017 closed.** Run 1's GDS was clean but built from a
+netlist in which a Yosys `peepopt` mis-transformation deleted PE row 6's A
+operand. `rtl/mem_a.sv`/`mem_b.sv` now use an explicit N-way mux over
+constant-base slices. Measured effect at `N = 8` on sky130hd:
+
+| Metric | Run 1 (defective) | Run 2 (fixed) |
+|---|---|---|
+| ABC-mapped cells | 53,880 | 55,457 (+2.9%) |
+| Flip-flops | 6,616 | 6,680 |
+| Die area | 1,478,510 um^2 | 1,525,570 um^2 (+3.2%) |
+| Final utilization | 40.46% | 40.38% |
+| Worst setup slack | +0.30 ns | **+0.05 ns** |
+| Reg-to-reg fmax | 121.98 MHz | **125.69 MHz** |
+| Worst hold slack | +0.42 ns | +0.43 ns |
+| Router / KLayout DRC | 0 / 0 | 0 / 0 |
+| Antenna violations | 1 | **0** |
+| Power | 77.8 mW | 78.0 mW |
+
+**100 MHz still closes; the DEC-009 ladder is still not invoked** and spec §13.2
+is unchanged. `CORE_UTILIZATION` stays at 35 and the floorplan is unchanged:
+ORFS sizes the die from cell area, so the +3.2% cells produced a +3.2% die and
+held utilization flat, which is the correct behaviour and needed no
+intervention. Zero of the four permitted closure iterations used.
+
+**DEC-017 is closed, not merely accepted.** The single residual met5 antenna
+violation from run 1 did not recur; run 2's diode-repair loop converged
+53 -> 5 -> **0** with 149 diodes. Before: 1. After: 0.
+
+The binding path is unchanged in kind: `rst` (input pin) -> ~1.7 ns of logic ->
+`tx_tlp_data[8]` (output pin). 8.00 of the 10.00 ns is the DEC-015 40% I/O
+budget. That assumption, not the design, is what sets the +0.05 ns margin;
+relaxing it to the ORFS-conventional 20% would restore ~4.3 ns. **It was not
+relaxed**, because the design closes without it. Recorded as the first lever for
+any future respin.
+
+The new `mem_a`/`mem_b` operand mux was checked explicitly against STA rather
+than assumed benign, per the coordinator's instruction: worst path into it is
+**+2.586 ns** (`mem_a.e_rdata[51]`) / **+2.658 ns** (`mem_b.e_rdata[33]`). Not a
+critical path. The replacement structure is *faster* than the `$shiftx` it
+replaced.
+
+**Process change adopted: `tb/gl/postsyn_replay.sh` is now a mandatory
+pre-flight before any full P&R run on changed RTL.** It ran 72/72 in 86 seconds
+on the fixed RTL before run 2 started. BUG-007 cost a full 110-minute flow plus
+a gate-level debug; this check would have caught it in under two minutes.

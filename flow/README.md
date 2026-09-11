@@ -76,6 +76,18 @@ All paths relative to `/home/pgratz/pcie-matmul`, with
 Stage numbering: `1_*` synth, `2_*` floorplan, `3_*` place, `4_*` cts,
 `5_*` route, `6_*` finish.
 
+## Pre-flight: ALWAYS run this before a full flow on changed RTL
+
+```bash
+tb/gl/postsyn_replay.sh 8          # 72/72 in ~86 s, no PDK needed
+```
+
+BUG-007 was a Yosys `peepopt` mis-transformation that produced a functionally
+wrong netlist from correct, lint-clean, 72/72-passing RTL. A full P&R run on
+that netlist cost 110 minutes and was clean but worthless. `postsyn_replay.sh`
+simulates the synthesized netlist and catches that entire class in ~1/75th of
+the time. Do not start `make` on changed RTL without it.
+
 ## Runtimes on this machine (24C/32T, serial make)
 
 | Stage | Elapsed |

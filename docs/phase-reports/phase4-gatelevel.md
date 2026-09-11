@@ -9,13 +9,117 @@ cells, 6,616 flops, N = 8)
 
 ---
 
-## Verdict
+## Verdict (re-run, 2026-09-11 — supersedes the run-1 verdict below)
 
 | Item | Result |
 |---|---|
-| Gate wording: "gate-level sim of at least the smoke test passes on `6_final.v` with SDF or unit delays" | **Literally MET** — `test_smoke` 4/4 with SDF back-annotation |
-| Is the netlist functionally the design? | **NO — BUG-007.** PE row 6 computes zero. Deterministic, reproduced on 3 operand pairs, with and without SDF |
-| Recommendation | **Do not sign off Phase 4.** The gate's floor passes on a netlist that returns the wrong answer for 1/8 of every matrix |
+| Gate wording: "gate-level sim of at least the smoke test passes on `6_final.v` with SDF or unit delays" | **MET** — with **SDF**, and with far more than the smoke test |
+| Is the netlist functionally the design? | **YES.** 4/4 smoke + **18/18 `test_matmul`** + 4 independent full 8×8 random matmuls vs the golden model, all on the netlist |
+| **C row 6 — the BUG-007 regression** | **CORRECT.** Called out explicitly in §Re-run below |
+| Recommendation | **Phase 4 gate item is met.** Sign-off may proceed |
+
+> The verdict below is run 1's and is retained as the record of BUG-007.
+> Run 1's artifacts are preserved as `base_prebug007_negctrl/`.
+
+---
+
+## Re-run against the fixed netlist (2026-09-11)
+
+**Delays: SDF back-annotated** (not unit delays), same three-fix model approach
+as run 1. The 21 new cell strength-variants required regenerating
+`tb/gl/models_sdf` — `build_sdf_models.py` patched **124** strength-qualified
+wrappers, up from 118. Compile 7.0 s → 308 MB `.vvp`.
+
+### Annotation rate
+
+| | run 1 | re-run |
+|---|---|---|
+| SDF `(CELL` entries | 112,854 | 116,058 |
+| `IOPATH` entries | 191,054 | 198,657 |
+| annotation failures | 6,616 | 6,680 |
+| **annotated** | **94.1%** | **94.2%** (109,378 / 116,058) |
+
+The 21 new variants did **not** change the failure mode. The failures are again
+**exactly the flop count** — 6,680 `dfxtp` instances, 6,680 warnings — and again
+the same cause: ORFS's flattened, escaped dotted instance names
+(`\u_app_bar0.beat_cnt[0]$_SDFFE_PP0P_`), which Icarus's SDF parser splits on
+the `.` instead of honouring the backslash escape. Combinational logic and the
+clock tree are annotated; flop clock-to-Q is not. Tool limitation, not a netlist
+property, and immaterial here because Icarus implements no timing checks at all
+— timing sign-off is OpenSTA's and it is closed (0 setup / 0 hold, +0.05 ns).
+
+### What was run
+
+| Stimulus | Result | Sim wall |
+|---|---|---|
+| `test_smoke` (4) | **4/4 PASS** | |
+| `probe_gl_row` — full random 8×8 matmul, A/B read back first, C vs golden | **PASS** | |
+| `probe_gl_drain` — 3 more random 8×8 matmuls, C pre-loaded with a sentinel, per-row verdict | **PASS** — "all 3 trials matched golden exactly" | |
+| `probe_gl_xprop` (3 X tests incl. internal census) | **3/3 PASS** | run total 4 m 36 s |
+| `probe_gl_pe_x` — explicit-path PE scan | **PASS** | |
+| **`test_matmul` — the entire module, 17 tests** | **17/17 PASS** | run total 4 m 40 s |
+
+**Total: 22 distinct gate-level tests, all passing, ~10 min including two 92 s
+SDF loads.**
+
+The full `test_matmul` module matters because it contains
+`test_matmul_c_addressing_and_persistence`, whose three complementary operand
+patterns (row-varying, lane-varying, two-index) exist specifically to detect any
+row permutation, lane permutation, transposition or drain-order reversal. It
+passes on the netlist.
+
+### C row 6 — the BUG-007 regression, explicitly
+
+**Correct.** Four independent checks agree:
+
+1. `probe_gl_drain` pre-loads every C word with a sentinel and runs three random
+   operand pairs. Run 1 reported `trial N: C row 6 -> drain wrote ZEROS`. The
+   re-run reports **"all 3 trials matched golden exactly"** — no row deviates.
+2. `probe_gl_row`: a full random 8×8 matmul matches golden in all 64 elements
+   (run 1: 8 of 64 differed, all in row 6, all DUT 0).
+3. Explicit-path scan of the netlist's PE registers:
+   `a_reg per row: [56, 56, 56, 56, 56, 56, 56, 56]` — **uniform**. Run 1's row 6
+   had none. `acc_reg` is 256 per row, `v_reg` 7 per row, both uniform.
+4. Static census of `6_final.v`: 56 `a_reg` nets in every one of the 8 rows.
+
+### One anomaly checked rather than waved past
+
+The same scan shows `b_reg per row: [64, 64, 64, 64, 64, 64, 64, 0]` — row 7 has
+no `b_reg`. Given BUG-007 was exactly "a register missing from one row", this
+was checked rather than assumed benign:
+
+- It is **pre-existing, not new**: the preserved `base_prebug007_negctrl/`
+  netlist has the identical `row7_b_reg=0`, and row 7 computed correctly there
+  even while row 6 was broken.
+- It is **expected by construction**: B flows north→south, so the south row's
+  `b_out` has no consumer — one of the three `UNUSEDSIGNAL` suppressions already
+  documented in `rtl/README.md`. Yosys forwards the value rather than registering
+  it onward.
+- It is **functionally disproven as a defect**: row 7 is correct in every random
+  matmul and in the permutation-sensitive `c_addressing` patterns.
+
+### X-propagation, corrected method
+
+- **Zero X on every top-level output**, every cycle, for 200 cycles after reset,
+  and again with `rst` held the REQ-109 minimum of 2 cycles.
+- **Explicit-path PE scan reaching all 8 generate rows** (the method that
+  replaces Phase 3's under-sampling walk): 1,088 PE nets across rows 0–7,
+  signals `prod`, `v_in`, `v_out` — **zero X by signal, zero X by row**.
+- Internal census: **256 of 51,138 nets X, static** — identical at reset+3 and
+  reset+100. Same benign residue as run 1 (256 of 49,112): anonymous internal
+  nets of the 64 Han-Carlson adder macros, masked by the accumulator's
+  reset/enable mux, never reaching a flop or an output.
+
+### One failure, triaged to my own harness
+
+`probe_gl_pe_x` failed on its first run asserting `a_reg absent from the
+netlist` — the BUG-007 signature. It was **my probe that was wrong**: at gate
+level the PE registers survive only as flop *instance* names, which carry no
+`.value`, so a net-only scan cannot see them while combinational `prod`/`v_in`/
+`v_out` survive as readable nets. Fixed to scan both populations; it then
+reported the uniform `a_reg` counts above. Recorded because a false BUG-007
+signature is exactly the kind of thing that should not be quietly edited away.
+
 
 The smoke test passes because it sets one non-zero operand (`A[0][0]=7`,
 `B[0][0]=6`) and therefore *expects* zeros everywhere else — a permanently-zero
