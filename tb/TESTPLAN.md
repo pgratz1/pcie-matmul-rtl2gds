@@ -1,9 +1,10 @@
 # Test plan — PCIe-Attached Matrix Multiplier
 
-**Against:** `docs/spec.md` **v1.1.2**, `docs/register-map.md` v1.0.0
-**Owner:** test-writer · **Phase 2 deliverable, updated for spec v1.1.0 → v1.1.2**
-**Status:** 71 cocotb tests + 5 static structural checks + 1 elaboration sweep.
-**Coverage: 126 of 126 requirements mapped. 125 verified by test, 1 (REQ-077)
+**Against:** `docs/spec.md` **v1.1.4**, `docs/register-map.md` v1.0.0
+**Owner:** test-writer · **Phase 2 deliverable, updated for spec v1.1.0 → v1.1.4
+and for the five Phase 3 testbench bugs (BUG-001/002/003/005/006)**
+**Status:** 72 cocotb tests + 5 static structural checks + 1 elaboration sweep.
+**Coverage: 127 of 127 requirements mapped. 126 verified by test, 1 (REQ-077)
 verified by review — see "Uncovered" at the bottom.**
 
 Every expected value in this suite comes from `docs/spec.md`,
@@ -49,7 +50,7 @@ from it. The suite has been run green at `N=4`, `N=8` and `N=16`.
 | `tb/tests/tb_common.py` | Shared helpers: bring-up, `discover_n`, `run_op`, byte-enabled raw accesses |
 | `tb/tests/test_smoke.py` | 4 tests |
 | `tb/tests/test_regs.py` | 15 tests |
-| `tb/tests/test_tlp.py` | 23 tests |
+| `tb/tests/test_tlp.py` | 24 tests |
 | `tb/tests/test_cfg.py` | 11 tests |
 | `tb/tests/test_matmul.py` | 17 tests |
 | `tb/tests/test_stress.py` | 1 test (120 randomized operations, scoreboarded) |
@@ -126,7 +127,7 @@ Rows marked *(new …)* / *(reworded …)* changed in spec v1.1.0 or v1.1.1.
 | REQ-041 | `test_tlp_posted_unsupported_types`, `test_tlp_td_ep_treated_as_unsupported` | MWr64, IOWr, MWr with TD/EP → discarded + error bit, no completion (see §6 note 3 on Messages) |
 | REQ-042 | `test_tlp_cfg_nonzero_device_or_function` | Device ∈ {1,31,5}, Function ∈ {1,7,3} → UR and `ERR_UNSUP_REQ` **stays clear**; Command unmodified |
 | REQ-043 | `test_tlp_inbound_completion_discarded` | inbound completion sets no error bit |
-| REQ-044 | `test_tlp_bar0_miss_and_window_overrun` | MRd/MWr at BAR0+0x3FFC with Length 2 → BAR0 miss; the same offset with Length 1 is serviced |
+| REQ-044 *(antecedent narrowed v1.1.4)* | `test_tlp_bar0_miss_and_window_overrun` | MRd/MWr at BAR0+0x3FFC with `L = 2` → BAR0 miss; the same offset with `L = 1` is serviced. `L = 2` is inside v1.1.4's narrowed `1 ≤ L ≤ 32` antecedent, so the test exercises REQ-044 and not REQ-127 (confirmed, not assumed) |
 | REQ-045 | `test_cfg_reset_values`, `test_cfg_unimplemented_offsets_read_zero`, `test_cfg_enumeration_assigns_bar0` | all 16 DWORDs of 0x00–0x3C, and 0x40/0x80/0x100/0x400/0xFFC read 0 |
 | REQ-046 | `test_cfg_command_register_rw_bits`, `test_cfg_write_byte_enables` | only Command[2:0], Cache Line Size and Interrupt Line are writable; byte enables respected |
 | REQ-047 | `test_cfg_write_to_readonly_is_accepted_and_ignored` | writes to RO / unimplemented cfg offsets return SC and change nothing |
@@ -206,6 +207,7 @@ Rows marked *(new …)* / *(reworded …)* changed in spec v1.1.0 or v1.1.1.
 | REQ-122 *(new v1.1.0)* | `test_reg_write_path_delay_is_constant` | D_WR measured exactly through the registered `irq` (REQ-012) and shown to be the **same value** for two register offsets, both irq directions, byte enables 1111/0011/0001, and the first/middle/last DWORD of a burst; asserted to lie in 1..3. Region invariance is checked in read-after-write form across `reg_file`, `mem_a`, `mem_b` and `mem_c` (§6 note 9) |
 | REQ-123 *(new v1.1.0, corrected v1.1.1)* | `test_matmul_done_timing` | `STATUS.DONE` set at **exactly** `t_beat + 4N + 2`, where `t_beat` is the cycle the `CTRL.START` payload DWORD transferred on `rx_tlp_*`; DONE is read off the registered `irq` (`t_done = t_irq − 1`). No `D_WR` term (§6 note 1) |
 | REQ-124 *(new v1.1.0)* | `test_reg_start_and_soft_reset_while_busy` | `START\|SOFT_RESET` in one DWORD while BUSY: STATUS reads 0 afterwards (so `ERR_START_BUSY` is **not** left set), PERF_CYCLES 0, OP_COUNT 0 (the START was ignored entirely), and the device still computes correctly afterwards |
+| REQ-127 *(new v1.1.4)* | `test_tlp_over_length_memory_request` | `L > 32` for `Length` ∈ {0 (= 1024 DW), 33, 100, 1023}, at two in-aperture addresses, one out-of-aperture address, and with `Command.MSE` both 1 and 0. **(a)** each `MRd` → a `Cpl` with UR, Length 0/ByteCount 4/LowerAddress 0 and REQ-024's reserved fields clear. **(b)** each `MWr` → no Completion at all. **(c)** framing preserved after every malformed `MWr`, checked through configuration space **and** BAR0; two framing shapes are used — payload matching the `Length` field (33, 100) and payload *shorter* than it claims (0, 1023), the harder reframe case. **(d)** `mem_a`, `mem_b`, `mem_c` and `SCRATCH` compared byte-for-byte against pre-loaded images after every case. **(e)** `ERR_UNSUP_REQ` cleared then re-checked for the read **and** the posted-write path, including with MSE = 0 |
 | REQ-126 *(new v1.1.2)* | `test_cfg_malformed_length_completion_fields`, `test_cfg_malformed_length_framing_preserved`, `test_cfg_malformed_length_sets_unsup_req` | **(a)** `CfgRd0`/`CfgWr0` with `Length` in {0,2,3,4,5,8,32} → a 3-beat `Cpl`, UR, Length 0/ByteCount 4/LowerAddress 0; the first transaction after reset checks the exact `DW0 = 0x0A000000`, `DW1 = 0x00002004` the spec quotes for `cfg_completer_id = 0x0000`. **(b)** a 7-offset configuration snapshot is unchanged across every malformed case. **(c)** after each malformed `CfgWr0` the next TLP parses correctly — checked in config space *and* through BAR0 (`ID` = `0x4D415431`), including two malformed TLPs back-to-back. **(d)** `ERR_UNSUP_REQ` set for malformed `Length` at Device/Function 0 **and** non-zero, paired with a negative control (identical request, `Length = 1`) that must leave the bit clear so REQ-042's bus-scan carve-out stays intact (§6 note 10) |
 | REQ-125 *(new v1.1.0)* | `test_matmul_soft_reset_during_drain` | SOFT_RESET swept across the whole drain window (`3N−1` … `4N+3` cycles after the START beat). For every landing: every `mem_c` word holds either its pre-operation value or its correct new value and never anything else; no row is part-old part-new; and the new rows form the contiguous suffix REQ-098's drain order requires. The sweep must produce at least one partially drained C, else it reports that it never landed inside `DRAIN` |
 | REQ-121 | `test_cfg_reenumerable_after_reset` | after `rst`: BAR0 == 0, MSE == 0, cfg 0x00 still identifies; re-enumeration works and BAR0 is usable |
@@ -350,12 +352,69 @@ which would break REQ-042 and make ordinary enumeration noisy.
 
 ---
 
+**Note 12 — the five Phase 3 testbench bugs, and what changed.** All five were
+in `tb/`; `rtl/` was byte-identical throughout.
+
+* **BUG-001 (`make test N=<n>` reused a stale binary).** `N` reached the
+  compiler through `COMPILE_ARGS`, which is not a prerequisite of cocotb's
+  `$(SIM_BUILD)/sim.vvp: $(VERILOG_SOURCES)` rule, so changing `N` alone never
+  triggered a rebuild and every "N sweep" was the `N = 8` binary re-run. Fixed
+  by making the parameterisation part of the build identity:
+  `SIM_BUILD := $(TB_DIR)/sim_build/$(SIM)-n$(N)`, with
+  `COCOTB_RESULTS_FILE` inside it so parallel `N` runs cannot clobber each
+  other. A `check-build-id` target now fails the build if `SIM_BUILD` ever
+  stops encoding `N`, so the hazard cannot silently return; `make build-id`
+  prints the directory. Verified by hashing: `sim.vvp` differs for every `N`
+  (see §7). This bug hid BUG-002, BUG-003 and BUG-005.
+* **BUG-002.** `test_tlp_back_to_back_tlps_no_idle_cycles` wrote 16 consecutive
+  C words, but C holds `N*N` = 4 words at `N = 2` and the rest is RAZ/WI by
+  REQ-091 — the DUT was right. The 16 writes now cycle through the implemented
+  words (`word = k mod N*N`), so the TLP count, and therefore the amount of
+  back-to-back stress, is identical at every `N`, and several of the
+  back-to-back TLPs now hit the *same* address, which is the harder case. No
+  assertion was relaxed.
+* **BUG-003.** `test_matmul_write_abc_while_busy` fired CTRL.START and three
+  region writes as one burst and relied on the operation outlasting the TLP
+  stream; at `N = 2` an operation is 10 cycles and the C write correctly
+  arrived after BUSY fell. Each region is now raced separately against a fresh
+  START, and the shim's recorded beat cycles are used to **assert** the write
+  committed inside `[t_start + 1, t_start + 4N + 2]`. If it lands outside, the
+  test fails as a positioning error rather than silently testing nothing.
+* **BUG-005.** `test_matmul_c_addressing_and_persistence` built
+  `A[i][j] = i*N + j − 100`, which leaves INT8 range at `N >= 16` and was
+  rejected by the golden model before the DUT saw it. A fully distinct `N*N`
+  INT8 pattern is impossible at `N = 32` (256 values, 1024 elements), so
+  distinctness is replaced by three complementary INT8-legal patterns —
+  row-varying, lane-varying, and two-index-varying — which between them still
+  detect any row permutation, lane permutation, transposition or drain-order
+  reversal.
+* **BUG-006.** `OP_TIMEOUT_NS` was a flat 20 us for a whole multi-completion
+  transfer. It is now `BASE + 40 ns/byte`, applied in `mem_read`, `mem_write`
+  and `raw_request` (scaled by the completion's DWORD length). The
+  backpressure probabilities were not lowered.
+
+---
+
 ## 7. Status as of this plan
 
 `make -C tb lint` — clean (Verilator 5.032 `--lint-only -Wall`, 0 warnings; 5/5
 structural checks pass).
-`make -C tb test` — **71 / 71 pass** at N=8, on `SEED=1` and `SEED=12345`.
-`make -C tb test N=4` / `N=16` — pass.
+`make -C tb test` — **72 / 72 pass** at every `N` tested, on two seeds, each
+with a genuine rebuild (BUG-001 fixed):
+
+| `N` | SEED=1 | SEED=424242 | `sim_build/icarus-n<N>/sim.vvp` md5 |
+|-----|--------|-------------|--------------------------------------|
+| 2 | 72/72 | 72/72 | `688715e0a6ab7266c48f7536caa36e6b` |
+| 4 | 72/72 | 72/72 | `b3a594814a145874161b6b2676c5ed91` |
+| 8 | 72/72 | 72/72 | `0f7196821ba8dfbfde0fad0e88a864aa` |
+| 16 | 72/72 | 72/72 | `63f5e516913028cd564418d683bc020e` |
+
+The four hashes are distinct, which is the direct evidence that each `N` now
+builds and runs its own binary. `N = 32` was **not run**: a single pass is
+estimated at 6–8 h under Icarus. Its elaboration is covered by
+`make -C tb elab-sweep`, and `test_matmul_c_addressing_and_persistence`'s
+operand patterns were chosen to stay INT8-legal and permutation-sensitive at
+`N = 32` (BUG-005) so the suite is ready for it whenever someone has the time.
 `make -C tb elab-sweep` — passes for N in {2,4,8,16,32}.
 Fail-ability confirmed: breaking the expected `ID` value in `test_smoke.py`
 produced `TESTS=4 PASS=3 FAIL=1`; the value was restored and re-verified. The

@@ -575,8 +575,10 @@ async def test_tlp_bar0_miss_and_window_overrun(dut):
         req = tb.make_mem_write(addr, (0x5A5A5A5A).to_bytes(4, "little"))
         await _expect_discard(tb, req, what.replace("MRd", "MWr"))
 
-    # REQ-044: offset + Length*4 > 16384 is a BAR0 miss even though the start
-    # address is inside the window.
+    # REQ-044: offset + L*4 > 16384 is a BAR0 miss even though the start
+    # address is inside the window.  v1.1.4 narrowed REQ-044's antecedent to
+    # 1 <= L <= 32 so that it is disjoint from REQ-127; L = 2 here is inside
+    # that range, so this test still exercises REQ-044 and not REQ-127.
     req = tb.make_mem_read(base + G.BAR0_SIZE - 4, length=2,
                            first_be=0xF, last_be=0xF)
     await _expect_ur(tb, req, "MRd starting at BAR0+0x3FFC with Length 2")
@@ -768,7 +770,7 @@ async def test_tlp_requests_serviced_in_order(dut):
             f"0x{val:08x}, expected 0x{exp:08x}")
 
 
-@cocotb.test(timeout_time=400, timeout_unit="us")
+@cocotb.test(timeout_time=600, timeout_unit="us")
 async def test_tlp_back_to_back_tlps_no_idle_cycles(dut):
     """REQ-005, REQ-013, REQ-020: consecutive TLPs with zero idle cycles.
 
@@ -777,57 +779,231 @@ async def test_tlp_back_to_back_tlps_no_idle_cycles(dut):
     TLP's `eop` transferred.  This test writes the same 16 DWORDs twice --
     once with the shim idling between packets, once with the packets pushed
     back to back -- and requires identical results.
+
+    The 16 writes are spread over the **implemented** words of C only,
+    `word = k mod N*N`, so the count of TLPs (and therefore the amount of
+    back-to-back stress) is the same at every `N` while every write targets a
+    real storage location.  Writing 16 consecutive C words unconditionally,
+    as this test originally did, lands outside `mem_c` at `N = 2`, where C
+    holds `N*N = 4` words and everything above is RAZ/WI by REQ-091 -- the
+    DUT was right and the test was wrong (BUG-002).  Cycling through the
+    words also means several of the back-to-back TLPs hit the *same* address,
+    which is the harder case for a write pipeline.
     """
     tb = await make_tb(dut)
-    await discover_n(tb)
+    n = await discover_n(tb)
 
-    pattern = [0x11110000 + k for k in range(16)]
+    words = n * n                      # implemented C words (REQ-091)
+    count = 16                         # TLPs issued, independent of N
+    pattern = [(k % words, 0x11110000 + k) for k in range(count)]
+
+    # Expected image: for each word, the value of the last write to it.
+    def expected_image():
+        img = [0] * words
+        for word, value in pattern:
+            img[word] = value
+        return b"".join(v.to_bytes(4, "little") for v in img)
+
+    exp = expected_image()
     base = G.MEM_C_BASE
 
-    exp = b"".join(v.to_bytes(4, "little") for v in pattern)
+    def diff(got):
+        return [w for w in range(words)
+                if got[4 * w:4 * w + 4] != exp[4 * w:4 * w + 4]]
 
-    # (1) one TLP at a time, with the stream idling in between
-    await tb.mem_write(base, bytes(16 * 4))
+    # --- (1) one TLP at a time, with the stream idling in between ---------
+    await tb.mem_write(base, bytes(4 * words))
     await tb.settle()
-    for k, value in enumerate(pattern):
-        await mwr_dword(tb, base + 4 * k, value, quiet_cycles=4)
-    spaced = bytes(await tb.mem_read(base, 16 * 4))
-    bad = [k for k in range(16) if spaced[4 * k:4 * k + 4] != exp[4 * k:4 * k + 4]]
+    for word, value in pattern:
+        await mwr_dword(tb, base + 4 * word, value, quiet_cycles=4)
+    spaced = bytes(await tb.mem_read(base, 4 * words))
+    bad = diff(spaced)
     assert not bad, (
-        f"REQ-022: DWORD(s) {bad} did not land when the 16 single-DWORD MWr "
-        f"TLPs were issued one at a time with idle cycles between them; "
-        f"read back {spaced.hex()}")
+        f"REQ-022: C word(s) {bad} did not land when the {count} "
+        "single-DWORD MWr TLPs were issued one at a time with idle cycles "
+        f"between them; read back {spaced.hex()}")
 
-    # (2) the identical 16 TLPs, injected with no gap at all
-    await tb.mem_write(base, bytes(16 * 4))
+    # --- (2) the identical TLPs, injected with no gap at all --------------
+    await tb.mem_write(base, bytes(4 * words))
     await tb.settle()
     before = tb.shim.rx_packets
     cap = tb.shim.start_capture()
     try:
-        for k, value in enumerate(pattern):
+        for word, value in pattern:
             await tb.shim.inject(tb.make_mem_write(
-                tb.bar0_addr + base + 4 * k, value.to_bytes(4, "little")))
+                tb.bar0_addr + base + 4 * word,
+                value.to_bytes(4, "little")))
         await tb.shim.wait_rx_idle()
         await ClockCycles(dut.clk, 8)
     finally:
         tb.shim.stop_capture()
 
     framed = tb.shim.rx_packets - before
-    assert framed == len(pattern), (
-        f"internal: only {framed} of {len(pattern)} TLPs were framed onto "
+    assert framed == count, (
+        f"internal: only {framed} of {count} TLPs were framed onto "
         "rx_tlp_*; the testbench driver, not the DUT, is at fault")
 
-    packed = bytes(await tb.mem_read(base, 16 * 4))
-    bad = [k for k in range(16) if packed[4 * k:4 * k + 4] != exp[4 * k:4 * k + 4]]
+    packed = bytes(await tb.mem_read(base, 4 * words))
+    bad = diff(packed)
     assert not bad, (
-        f"REQ-005/REQ-013: DWORD(s) {bad} of 16 did not take effect when the "
-        "TLPs were presented back-to-back (the same writes with idle cycles "
-        "between them all landed).\n"
+        f"REQ-005/REQ-013: C word(s) {bad} of {words} did not take effect "
+        f"when {count} single-DWORD MWr TLPs were presented back-to-back "
+        "with no idle cycle between eop and the next sop (the identical "
+        "writes with idle cycles between them all landed).\n"
         f"  expected {exp.hex()}\n  read back {packed.hex()}")
-    assert packed == exp, (
-        "REQ-005/REQ-013: 16 single-DWORD MWr TLPs presented back-to-back "
-        "with no idle cycle between eop and the next sop did not all take "
-        f"effect.\n  expected {exp.hex()}\n  read back {packed.hex()}\n"
-        "  (the identical writes with idle cycles between them DID land, so "
-        "the DUT loses or mis-parses a TLP whose sop arrives immediately "
-        "after the previous TLP's eop)")
+    assert packed == spaced, (
+        "REQ-005: the back-to-back and the idle-separated write sequences "
+        f"left different contents in C\n  spaced: {spaced.hex()}\n"
+        f"  packed: {packed.hex()}")
+
+
+# ---------------------------------------------------------------------------
+# REQ-127 (new in spec v1.1.4): over-length memory requests.
+#
+# `L` is the *decoded* DWORD length: a Length field of 0 decodes to 1024 DW,
+# not zero (§7.2.1, REQ-017).  Any `L > 32` is rejected regardless of address
+# and regardless of Command.MSE, with five observable clauses (a)..(e).
+#
+# Note on framing: two shapes are exercised deliberately.  For Length 33 and
+# 100 the MWr carries exactly that many payload DWORDs, so the drain consumes
+# a payload that matches the header.  For the Length field 0 (= 1024 DW) and
+# 1023 the TLP carries a *shorter* framed payload than its Length claims,
+# which is the harder case -- the parser must reframe on `rx_tlp_eop` and not
+# sit waiting for DWORDs that never come.
+# ---------------------------------------------------------------------------
+
+OVER_LENGTH_CASES = [
+    # (Length field, framed payload DWORDs for an MWr, description)
+    (0, 16, "Length field 0 (decodes to 1024 DW, REQ-017)"),
+    (33, 33, "Length 33 (one over the 32 DW cap)"),
+    (100, 100, "Length 100"),
+    (1023, 16, "Length 1023 (maximum encodable)"),
+]
+
+
+def _over_length_mrd(tb, addr, length):
+    tlp = tb.make_mem_read(addr, length=1, first_be=0xF)
+    tlp.length = length
+    tlp.last_be = 0xF if length != 1 else 0
+    return tlp
+
+
+def _over_length_mwr(tb, addr, length, framed_dwords):
+    tlp = tb.make_mem_write(
+        addr,
+        b"".join((0xFFFFFFFF).to_bytes(4, "little")
+                 for _ in range(framed_dwords)),
+        first_be=0xF, last_be=0xF)
+    tlp.length = length                      # header claims `length` DWORDs
+    return tlp
+
+
+@cocotb.test(timeout_time=2000, timeout_unit="us")
+async def test_tlp_over_length_memory_request(dut):
+    """REQ-127 (a)..(e): `L > 32` memory requests, in and out of BAR0.
+
+    Clause (c) -- the surplus payload of a malformed `MWr` is drained through
+    `rx_tlp_eop` so the next TLP still parses -- is the one that matters: a
+    parser that desynchronizes here makes every later test fail for a
+    misleading reason.  It is checked after every malformed write, through two
+    independent decode paths (configuration space and BAR0).
+    """
+    tb = await make_tb(dut)
+    n = await discover_n(tb)
+
+    # Known contents for clause (d).
+    a_img = bytes((0x40 + k) & 0x7F for k in range(n * n))
+    b_img = bytes((0x10 + k) & 0x7F for k in range(n * n))
+    c_img = b"".join(int(0x0BAD0000 + k).to_bytes(4, "little")
+                     for k in range(n * n))
+    await tb.mem_write(G.MEM_A_BASE, a_img)
+    await tb.mem_write(G.MEM_B_BASE, b_img)
+    await tb.mem_write(G.MEM_C_BASE, c_img)
+    await mwr_dword(tb, G.REG_SCRATCH, 0x1234ABCD)
+
+    inside = [tb.bar0_addr + 0x0000, tb.bar0_addr + G.MEM_C_BASE]
+    outside = [tb.bar0_addr + G.BAR0_SIZE + 0x40]
+
+    async def _check_untouched(what):
+        got = bytes(await tb.mem_read(G.MEM_A_BASE, n * n))
+        assert got == a_img, f"REQ-127(d): mem_a modified by {what}"
+        got = bytes(await tb.mem_read(G.MEM_B_BASE, n * n))
+        assert got == b_img, f"REQ-127(d): mem_b modified by {what}"
+        got = bytes(await tb.mem_read(G.MEM_C_BASE, 4 * n * n))
+        assert got == c_img, f"REQ-127(d): mem_c modified by {what}"
+        got = await tb.read_dword(G.REG_SCRATCH)
+        assert got == 0x1234ABCD, (
+            f"REQ-127(d): SCRATCH reads 0x{got:08x} after {what}; no register "
+            "may be modified")
+
+    async def _check_framing(what):
+        ident = await tb.cfg_read_dword(0x00)
+        assert ident == G.CFG_ID_DWORD, (
+            f"REQ-127(c): after {what}, the next CfgRd0 of cfg 0x00 returned "
+            f"0x{ident:08x} instead of 0x{G.CFG_ID_DWORD:08x}; the surplus "
+            "payload must be consumed through rx_tlp_eop so framing survives")
+        got = await tb.read_dword(G.REG_ID)
+        assert got == G.ID_VALUE, (
+            f"REQ-127(c): after {what}, a BAR0 read of ID returned "
+            f"0x{got:08x} instead of 0x{G.ID_VALUE:08x}; the transaction "
+            "layer lost framing")
+
+    for length, framed, desc in OVER_LENGTH_CASES:
+        for addr in inside + outside:
+            where = ("inside BAR0" if addr - tb.bar0_addr < G.BAR0_SIZE
+                     else "outside BAR0")
+            what = f"MRd, {desc}, address {where}"
+
+            # --- (a) MRd -> UR Cpl per REQ-035, and (e) -------------------
+            await mwr_dword(tb, G.REG_STATUS, G.ST_ERR_UNSUP_REQ)
+            cpl = await tb.raw_request(_over_length_mrd(tb, addr, length))
+            _check_fmt_type(cpl, CPL_FMT_TYPE, what)
+            assert cpl.status == CplStatus.UR, (
+                f"REQ-127(a): {what} -> status {cpl.status!r}, expected UR")
+            assert cpl.length == 0 and cpl.byte_count == 4 \
+                and cpl.lower_address == 0, (
+                    f"REQ-127(a)/REQ-035: {what} -> Length={cpl.length}, "
+                    f"ByteCount={cpl.byte_count}, "
+                    f"LowerAddress={cpl.lower_address}; must be 0 / 4 / 0")
+            _check_reserved_fields(cpl, what)
+            st = await tb.read_dword(G.REG_STATUS)
+            assert st & G.ST_ERR_UNSUP_REQ, (
+                f"REQ-127(e): {what} was answered UR but STATUS = "
+                f"0x{st:08x}; ERR_UNSUP_REQ must be set")
+
+            # --- (b)(c) MWr -> no Completion, framing preserved -----------
+            what = f"MWr, {desc} with {framed} framed payload DWORDs, {where}"
+            await mwr_dword(tb, G.REG_STATUS, G.ST_ERR_UNSUP_REQ)
+            before = tb.shim.rx_packets
+            await tb.raw_request(
+                _over_length_mwr(tb, addr, length, framed),
+                expect_completion=False)
+            assert tb.shim.rx_packets - before == 1, (
+                "internal: the malformed MWr was not framed as one packet")
+            await _check_framing(what)
+            st = await tb.read_dword(G.REG_STATUS)
+            assert st & G.ST_ERR_UNSUP_REQ, (
+                f"REQ-127(e): STATUS = 0x{st:08x} after {what}; "
+                "ERR_UNSUP_REQ must be set for the posted case too")
+            await _check_untouched(what)
+
+    # --- the same, with Command.MSE = 0 ---------------------------------
+    await tb.cfg_write_dword(0x04, 0x0000)
+    cap_desc = "Length 33 MRd with Command.MSE = 0"
+    cpl = await tb.raw_request(_over_length_mrd(tb, inside[0], 33))
+    _check_fmt_type(cpl, CPL_FMT_TYPE, cap_desc)
+    assert cpl.status == CplStatus.UR, (
+        f"REQ-127(a): {cap_desc} -> status {cpl.status!r}, expected UR "
+        "(rejection is independent of Command.MSE)")
+    await tb.raw_request(_over_length_mwr(tb, inside[0], 0, 16),
+                         expect_completion=False)
+    ident = await tb.cfg_read_dword(0x00)
+    assert ident == G.CFG_ID_DWORD, (
+        "REQ-127(c): framing lost after an over-length MWr with MSE = 0")
+    await tb.cfg_write_dword(0x04, G.CMD_MSE | G.CMD_BME)
+    st = await tb.read_dword(G.REG_STATUS)
+    assert st & G.ST_ERR_UNSUP_REQ, (
+        f"REQ-127(e): STATUS = 0x{st:08x} after over-length requests issued "
+        "with Command.MSE = 0; the error bit must be set regardless of MSE")
+    await _check_untouched("over-length requests with MSE = 0")
+    await mwr_dword(tb, G.REG_STATUS, G.ST_ERR_UNSUP_REQ)

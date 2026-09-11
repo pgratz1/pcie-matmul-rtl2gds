@@ -33,9 +33,30 @@ from .tlp_stream_shim import TlpStreamShim
 # 100 MHz, spec 13.2 / DEC-009
 CLK_PERIOD_NS = 10
 
-# Generous per-operation timeout: a 32 DW burst on a strictly serialized DUT
-# (DEC-007) is well under 100 cycles, so 2000 cycles means "hung", not "slow".
-OP_TIMEOUT_NS = 20000
+# Per-operation timeout.
+#
+# BUG-006: a fixed budget does not survive large `N`.  `cocotbext-axi` splits
+# one `window.read(0x3000, 4*N*N)` into `ceil(4*N*N/128)` sequential 32-DWORD
+# requests *inside the same timeout*, so the budget has to cover the whole
+# transfer, not one TLP.  At N=16 that is 8 completions (~280 beats) and at
+# N=32 it is 32 completions (~1120 beats, ~11.2 us at zero backpressure) --
+# against a flat 20 us, with `test_stress` already running at 15% stall.
+#
+# The budget is therefore `BASE + NS_PER_BYTE * length`.  NS_PER_BYTE = 40 is
+# 4 clock periods per byte, i.e. one 32-bit beat per 16 cycles: 16x slack over
+# the 1 beat/cycle the DUT can sustain, which covers the 90%/90% backpressure
+# the stress tests use and still fails fast on a genuinely hung DUT.
+BASE_OP_TIMEOUT_NS = 20000
+NS_PER_BYTE = 40
+
+
+def op_timeout_ns(length=0):
+    """Timeout for a transfer of `length` bytes (0 for a single small TLP)."""
+    return BASE_OP_TIMEOUT_NS + NS_PER_BYTE * int(length)
+
+
+# Kept as the "one small TLP" budget; call `op_timeout_ns(n)` for transfers.
+OP_TIMEOUT_NS = BASE_OP_TIMEOUT_NS
 
 DEFAULT_SEED = 1
 
@@ -253,8 +274,10 @@ class Host:
         exercise the wrong order of operations.
         """
         assert self.window is not None, "call enumerate() first"
-        await self.window.write(offset, bytes(data),
-                                timeout=OP_TIMEOUT_NS, timeout_unit="ns")
+        data = bytes(data)
+        await self.window.write(offset, data,
+                                timeout=op_timeout_ns(len(data)),
+                                timeout_unit="ns")
         await self.drain()
 
     async def drain(self):
@@ -265,7 +288,8 @@ class Host:
     async def mem_read(self, offset, length):
         assert self.window is not None, "call enumerate() first"
         return await self.window.read(offset, length,
-                                      timeout=OP_TIMEOUT_NS, timeout_unit="ns")
+                                      timeout=op_timeout_ns(length),
+                                      timeout_unit="ns")
 
     async def write_dword(self, offset, value):
         await self.mem_write(offset, int(value & 0xFFFFFFFF).to_bytes(4, "little"))
@@ -368,13 +392,16 @@ class Host:
         return tlp
 
     async def raw_request(self, tlp, expect_completion=True,
-                          timeout_ns=OP_TIMEOUT_NS, quiet_cycles=8):
+                          timeout_ns=None, quiet_cycles=8):
         """Inject `tlp` and return the DUT's Completion (or None).
 
         Outbound TLPs are captured rather than forwarded upstream, because the
         root complex never issued these requests and would log them as
         unexpected completions.
         """
+        if timeout_ns is None:
+            # A read completion is `length` DWORDs; scale with it (BUG-006).
+            timeout_ns = op_timeout_ns(4 * max(1, getattr(tlp, "length", 1)))
         cap = self.shim.start_capture()
         try:
             await self.shim.inject(tlp)

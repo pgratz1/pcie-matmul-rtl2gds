@@ -36,6 +36,16 @@ COCOTB_TOPLEVEL := matmul_top
 N ?= 8
 SEED ?=
 
+# BUG-001: `N` reaches the compiler through COMPILE_ARGS, which is NOT a
+# prerequisite of cocotb's `$(SIM_BUILD)/sim.vvp: $(VERILOG_SOURCES)` rule, so
+# changing `N` alone left make thinking the binary was up to date and the old
+# one was silently re-run.  Giving each `N` (and each simulator) its own build
+# directory makes the parameterisation part of the build identity, so a change
+# of `N` always rebuilds -- and lets several `N` run in parallel without
+# clobbering each other.
+SIM_BUILD := $(TB_DIR)/sim_build/$(SIM)-n$(N)
+COCOTB_RESULTS_FILE := $(SIM_BUILD)/results.xml
+
 # --- source list ------------------------------------------------------------
 # rtl/filelist.f is the authority (CLAUDE.md); fall back to a glob so the
 # harness still works the moment the first .sv appears.
@@ -83,13 +93,17 @@ EXTRA_ARGS += --trace-fst
 COMPILE_ARGS += -Wall -GN=$(N)
 endif
 
-.PHONY: usage test sim-guard lint lint-verilator lint-rules waves clean \
-        elab-sweep list-tests sources
+.PHONY: usage test sim-guard check-build-id lint lint-verilator lint-rules \
+        waves clean elab-sweep list-tests sources build-id
 
 usage:
 	@echo "targets: lint | test [TEST=<module>] | waves | elab-sweep | clean"
 	@echo "vars:    SIM=$(SIM)  N=$(N)  SEED=$(or $(SEED),1 (default))"
+	@echo "build:   $(SIM_BUILD)"
 	@echo "sources: $(words $(VERILOG_SOURCES)) file(s)"
+
+build-id:
+	@echo "$(SIM_BUILD)"
 
 sources:
 	@for f in $(VERILOG_SOURCES); do echo $$f; done
@@ -135,7 +149,17 @@ elab-sweep:
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
-sim-guard:
+# Guard against BUG-001 ever coming back: the build directory must carry the
+# parameterisation, so that `make test N=<n>` cannot reuse another N's binary.
+check-build-id:
+	@case "$(SIM_BUILD)" in \
+	    *n$(N)) : ;; \
+	    *) echo "ERROR: SIM_BUILD ($(SIM_BUILD)) does not encode N=$(N);"; \
+	       echo "       a change of N would silently reuse a stale sim.vvp"; \
+	       exit 1 ;; \
+	esac
+
+sim-guard: check-build-id
 	@if [ -z "$(strip $(VERILOG_SOURCES))" ]; then \
 	    echo "ERROR: no RTL sources found."; \
 	    echo "       expected $(FILELIST) or $(RTL_DIR)/*.sv"; \
@@ -155,11 +179,11 @@ endif
 
 waves:
 	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) WAVES=1 test
-	@echo "wave file: $(TB_DIR)/sim_build/$(COCOTB_TOPLEVEL).fst"
+	@echo "wave file: $(SIM_BUILD)/$(COCOTB_TOPLEVEL).fst"
 
 clean::
 	@rm -rf $(TB_DIR)/sim_build $(TB_DIR)/results.xml \
 	        $(TB_DIR)/__pycache__ $(TB_DIR)/tests/__pycache__ \
-	        $(TB_DIR)/models/__pycache__
+	        $(TB_DIR)/models/__pycache__ $(TB_DIR)/tools/__pycache__
 
 .DEFAULT_GOAL := usage

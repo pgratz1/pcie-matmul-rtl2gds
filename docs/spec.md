@@ -1,6 +1,6 @@
 # PCIe-Attached Matrix Multiplier — Architecture and Micro-Architecture Specification
 
-**Spec version: 1.1.3**
+**Spec version: 1.1.4**
 **Date: 2026-09-10**
 **Owner: spec-writer**
 **Status: Phase 1 deliverable. Binding on rtl-designer, test-writer, rtl-reviewer, circuit-designer.**
@@ -24,6 +24,8 @@ Change log:
 | 1.1.2 | 2026-09-10 | REQ-119's v1.1.0 repair was still unsatisfiable at `N`=16 and `N`=32 (one operand is 64 and 256 DW, over the 32-DW burst cap); burst count is now `ceil(ceil(N*N/4)/32)`. REQ-120 re-checked and confirmed correct for all legal `N`. Added REQ-126 for malformed-`Length` configuration requests. | **Corrected:** REQ-119. **Added:** REQ-126. **Re-confirmed, unchanged:** REQ-120. |
 
 | 1.1.3 | 2026-09-10 | Overlap-class cleanup. Two older requirements had antecedents broad enough to literally forbid what a newer, more specific requirement demands, with the conflict resolved only by a precedence sentence. Both antecedents narrowed so the pairs are disjoint by construction. No behavior change. | **Antecedent narrowed:** REQ-042 (now disjoint from REQ-126), REQ-070 (now disjoint from REQ-124). |
+
+| 1.1.4 | 2026-09-10 | Phase 3 BUG-004: nothing defined the *observable outcome* of rejecting an in-aperture memory request whose decoded length exceeds 32 DW (including the `Length`=0 / 1024-DW encoding). REQ-018 mandated the decision to reject but the consequence chain dangled — REQ-040/041 key off TLP *type*, and an over-length `MRd` is a supported type. No behavior change. | **Added:** REQ-127. **Antecedent narrowed:** REQ-044 (now disjoint from REQ-127). |
 
 ### Overlap audit (v1.1.3)
 
@@ -766,9 +768,55 @@ Definitions used below, matching `cocotbext-pcie` bit-for-bit:
   entirely and is governed by REQ-126, whatever its Device and Function Number.
 - **REQ-043** An inbound `Cpl`/`CplD` shall be discarded with no error bit set and no
   Completion emitted.
-- **REQ-044** An `MRd` or `MWr` that would cross the end of the BAR0 window
-  (`offset + Length*4 > 16384`) shall be treated as not matching BAR0 (REQ-038 /
-  REQ-039).
+- **REQ-044** *(antecedent narrowed in v1.1.4 so it is disjoint from REQ-127 by
+  construction.)* An `MRd` or `MWr` **whose decoded length `L` is in the range 1 to 32
+  DWORDs** that would cross the end of the BAR0 window (`offset + L*4 > 16384`) shall
+  be treated as not matching BAR0 (REQ-038 / REQ-039). A request with `L > 32` is
+  outside this requirement entirely and is governed by REQ-127, whatever its address.
+- **REQ-127** *(new in v1.1.4.)* Let `L` be the decoded DWORD length of an inbound
+  `MRd` or `MWr`, where a `Length` field of **0 decodes to 1024 DW, not zero**
+  (§7.2.1, REQ-017). A memory request with `L > 32` — which includes the `Length` = 0
+  / 1024-DW encoding and every value 33 through 1023 — shall be rejected by `tlp_rx`
+  (REQ-017, REQ-018), and that rejection shall be observable as follows, **regardless
+  of whether the request's address falls inside the BAR0 aperture and regardless of
+  `Command.MSE`**:
+  (a) for an `MRd`, a `Cpl` carrying UR status, formatted per REQ-035;
+  (b) for an `MWr`, no Completion at all (REQ-036);
+  (c) for an `MWr`, every payload DWORD consumed and discarded through `rx_tlp_eop`,
+  so that framing is preserved and the **next** TLP is parsed correctly — the same
+  drain-and-reframe behaviour REQ-019 requires generally and REQ-126(c) requires for
+  an over-length configuration write. A malformed write must never desynchronize the
+  parser;
+  (d) no byte of `mem_a`, `mem_b` or `mem_c`, and no register, modified; and
+  (e) `STATUS.ERR_UNSUP_REQ` set.
+
+> **How REQ-127 stays disjoint from its neighbours by construction** (v1.1.4; this is
+> the third instance of the overlap defect class, so the reasoning is recorded rather
+> than left implicit).
+>
+> - **vs REQ-044** — REQ-044's antecedent is now bounded to `1 <= L <= 32` and
+>   REQ-127's requires `L > 32`. The two antecedents cannot both hold. Before v1.1.4 a
+>   request with `L = 1024` at offset `0x3F00` satisfied both.
+> - **vs REQ-056** — REQ-056 constrains `app_bar0`, which sits *downstream* of
+>   `tlp_rx`. An over-length request is rejected in `tlp_rx` and no `app_req` is ever
+>   generated for it, so `app_bar0` never observes a burst outside 1..32 and REQ-056's
+>   antecedent is never reached. Disjoint by module boundary, not by precedence.
+> - **vs REQ-017 and REQ-018** — complementary rather than overlapping. REQ-017 fixes
+>   the `Length` = 0 decode and REQ-018 mandates the *decision* to reject; REQ-127
+>   states what that rejection must *look like* at the pins and in `STATUS`. That
+>   consequence chain was the actual gap: REQ-040 and REQ-041 key off the TLP *type*
+>   tables in §4.3, and an over-length `MRd` is a supported type, so neither of them
+>   reaches it. REQ-018 said "reject" and nothing downstream defined what rejecting
+>   looked like.
+> - **vs REQ-038 and REQ-039** — those key off a BAR0 address miss or `MSE` = 0.
+>   REQ-127 is explicitly address- and `MSE`-independent, so an over-length request is
+>   handled identically whether it hits BAR0 or not, and no case falls to both with
+>   conflicting outcomes (the outcomes coincide in any event).
+>
+> **§4.5 is not a substitute for any of this.** It configures the host model's
+> `max_payload_size` and `max_read_request_size` so a *well-behaved* root complex never
+> emits an over-length request. That is a statement about the testbench, not about the
+> DUT, and it is exactly the stimulus a negative test is supposed to violate.
 - **REQ-126** *(new in v1.1.2.)* A `CfgRd0` or `CfgWr0` whose `Length` field is not
   exactly 1 is malformed (§7.2.3; PCIe Base r6.0 §2.2.7 fixes Configuration Requests
   at one DWORD). The DUT shall:
@@ -1624,7 +1672,7 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-041 | 7.6 | Unsupported posted TLP -> discarded, `STATUS.ERR_UNSUP_REQ` set, no Completion. |
 | REQ-042 | 7.6 | `CfgRd0`/`CfgWr0` **with `Length` == 1** and non-zero Device or Function number -> UR, and no error bit set. **Antecedent narrowed in v1.1.3.** |
 | REQ-043 | 7.6 | Inbound `Cpl`/`CplD` discarded silently; no error bit, no Completion. |
-| REQ-044 | 7.6 | A memory request running past the end of the 16 KiB BAR0 window is treated as a BAR0 miss. |
+| REQ-044 | 7.6 | A memory request **of length 1..32 DW** running past the end of the 16 KiB BAR0 window is treated as a BAR0 miss. **Antecedent narrowed in v1.1.4.** |
 | REQ-045 | 8.3 | `CfgRd0` returns the §8.2 values for 0x00–0x3C and `0x00000000` for 0x40–0xFFF. |
 | REQ-046 | 8.3 | `CfgWr0` updates only RW fields and only byte-enabled bytes. |
 | REQ-047 | 8.3 | `CfgWr0` to an RO or unimplemented offset returns SC and changes no state. |
@@ -1707,8 +1755,9 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-124 | 10.3 | `START` + `SOFT_RESET` in one DWORD while `BUSY`: `SOFT_RESET` takes full effect, `START` is ignored, `STATUS.ERR_START_BUSY` reads 0 afterwards. **New in v1.1.0.** |
 | REQ-125 | 10.3 | `SOFT_RESET` during `DRAIN` aborts the drain; every `mem_c` word then holds either its pre-operation value or its correct new value, never an undefined one. **New in v1.1.0.** |
 | REQ-126 | 7.6 | `CfgRd0`/`CfgWr0` with `Length != 1` -> UR Completion, no config register modified, surplus payload drained to `eop`, `STATUS.ERR_UNSUP_REQ` set. **New in v1.1.2.** |
+| REQ-127 | 7.6 | Memory request with decoded length > 32 DW (including `Length`=0 meaning 1024) -> UR for `MRd`, no Completion for `MWr`, payload drained to `eop` with framing preserved, nothing modified, `STATUS.ERR_UNSUP_REQ` set — independent of address and `MSE`. **New in v1.1.4.** |
 
-**Total: 126 requirements, REQ-001 … REQ-126, unique and contiguous.**
+**Total: 127 requirements, REQ-001 … REQ-127, unique and contiguous.**
 
 REQ-001 … REQ-121 keep the identical IDs they had in v1.0.0; none has ever been
 renumbered or repurposed. REQ-122 … REQ-125 were added in v1.1.0; REQ-126 in v1.1.2.

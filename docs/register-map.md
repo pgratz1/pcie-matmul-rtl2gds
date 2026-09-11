@@ -1,6 +1,6 @@
 # BAR0 Register Map — PCIe-Attached Matrix Multiplier
 
-**Version: 1.1.3 — matches `docs/spec.md` v1.1.3**
+**Version: 1.1.4 — matches `docs/spec.md` v1.1.4**
 **Date: 2026-09-10**
 **Owner: spec-writer**
 
@@ -120,7 +120,7 @@ Spec cross-reference: REQ-068 … REQ-073, REQ-124, REQ-125.
 | Bits | Name | Access | Reset | Description |
 |------|------|--------|-------|-------------|
 | 31:5 | — | RO | 0 | Reserved. Reads 0, writes ignored. |
-| 4 | `ERR_UNSUP_REQ` | W1C | 0 | Set when the device receives an Unsupported Request: a Memory Read/Write that misses BAR0 or arrives with `Command.MSE` = 0, an `MRd`/`MWr` longer than 32 DW, a 64-bit-address or I/O or atomic or Message or Type 1 config request, a Type 0 config request whose `Length` is not 1 (spec REQ-126), or any TLP with `TD` = 1 or `EP` = 1. **Not** set by a Type 0 config request to a non-zero Device or Function number (which happens on every bus scan). |
+| 4 | `ERR_UNSUP_REQ` | W1C | 0 | Set when the device receives an Unsupported Request: a Memory Read/Write that misses BAR0 or arrives with `Command.MSE` = 0, an `MRd`/`MWr` whose decoded length exceeds 32 DW (spec REQ-127; note a `Length` field of 0 decodes to 1024 DW, not zero), a 64-bit-address or I/O or atomic or Message or Type 1 config request, a Type 0 config request whose `Length` is not 1 (spec REQ-126), or any TLP with `TD` = 1 or `EP` = 1. **Not** set by a Type 0 config request to a non-zero Device or Function number (which happens on every bus scan). |
 | 3 | `ERR_WRITE_BUSY` | W1C | 0 | Set when a host write targets region A, B or C while `STATUS.BUSY` = 1. The write is discarded. |
 | 2 | `ERR_START_BUSY` | W1C | 0 | Set when `CTRL.START` is written 1, **and `CTRL.SOFT_RESET` is written 0 in the same DWORD**, while `STATUS.BUSY` = 1. The running operation is unaffected. If both bits are written 1, `SOFT_RESET` wins and this bit reads 0 afterwards (spec REQ-124). |
 | 1 | `DONE` | W1C | 0 | Set on the cycle the operation completes, `4*N + 2` cycles after `CTRL.START` was accepted. Persists until written with 1, or until `CTRL.SOFT_RESET` or `rst`. |

@@ -288,6 +288,29 @@ When adding a requirement that carves an exception out of an existing one, amend
 existing one's antecedent in the same edit. Decided by: spec-writer, on rtl-reviewer's
 round-2 finding.
 
+## 2026-09-10 — Spec correction, v1.1.3 -> v1.1.4: BUG-004, over-length memory requests
+**Context:** Phase 3 found zero RTL defects but reported BUG-004 — nothing specified the
+outcome for an in-aperture memory request with decoded length > 32 DW, including the
+`Length` = 0 / 1024-DW encoding. The RTL returns UR (`tlp_rx.sv:200`), which is correct
+but was unrequired and therefore untested.
+**Refinement of the diagnosis:** REQ-017 and REQ-018 *did* already mandate rejecting
+such a request, and REQ-019 already mandated the payload drain. The real gap was the
+**dangling consequence chain**: REQ-018 said "reject as an unsupported request", but the
+requirements that define what rejection looks like — REQ-040 and REQ-041 — key off the
+TLP *type* tables in §4.3, and an over-length `MRd` is a *supported* type. So nothing
+said UR, nothing said `ERR_UNSUP_REQ`, nothing said the write payload must be drained
+without desynchronizing the parser.
+**Decision:** added REQ-127 stating the observable outcome, explicitly independent of
+address and of `Command.MSE`, and explicitly decoding `Length` = 0 as 1024 DW rather
+than zero. Narrowed REQ-044's antecedent to `1 <= L <= 32` so the two are disjoint by
+construction — this was the third instance of the overlap defect class (after
+REQ-042/126 and REQ-070/124), so §7.6 now records the disjointness argument against
+REQ-044, REQ-056, REQ-017/018 and REQ-038/039 inline.
+**Lesson:** a requirement that says "shall reject" is incomplete unless some other
+requirement defines the observable form of rejection *for that antecedent*. Deferring to
+a table that is keyed on a different attribute (type, not length) does not compose.
+Decided by: spec-writer, on validation-specialist's BUG-004.
+
 ## 2026-09-10 — Open questions for the human (spec-writer, Phase 1)
 None of these block Phase 2. They are recorded so they are not silently omitted.
 

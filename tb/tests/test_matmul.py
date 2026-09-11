@@ -164,38 +164,90 @@ async def test_matmul_start_while_busy(dut):
                               "unaffected by the ignored STARTs.")
 
 
-@cocotb.test(timeout_time=600, timeout_unit="us")
+@cocotb.test(timeout_time=900, timeout_unit="us")
 async def test_matmul_write_abc_while_busy(dut):
-    """REQ-062: A/B/C writes during an operation are discarded + flagged."""
+    """REQ-062: A/B/C writes during an operation are discarded + flagged.
+
+    "While BUSY" is made an explicit, *checked* precondition rather than an
+    accident of `N`.  The original test fired one burst of four TLPs --
+    CTRL.START, then writes to A, B and C -- and relied on the operation
+    outlasting the TLP stream.  Each single-DWORD MWr is 4 beats, so the C
+    write's payload beat lands roughly 12 cycles after START's; an operation
+    is `4N + 2` cycles, which is 34 at N=8 but only **10** at N=2, so at N=2
+    the C write arrived after BUSY had fallen and was correctly accepted.
+    The RTL was right and the test's timing assumption was wrong (BUG-003).
+
+    Each region is now raced separately against a freshly started operation,
+    and the beat cycles recorded by the shim are used to assert that the write
+    really did commit inside `[t_start + 1, t_start + 4N + 2]`, the window
+    REQ-074 defines for BUSY (spec 9.6 v1.1.1 fixes `t_start = t_beat`).  If
+    the write lands outside that window the test fails as a positioning error
+    instead of silently testing nothing.
+    """
     tb = await make_tb(dut)
     n = await discover_n(tb)
     rng = random.Random(tb.seed ^ 0x8051)
 
     a, b = random_matrix(rng, n), random_matrix(rng, n)
-    await load_ab(tb, a, b, n)
     exp = G.matmul_golden(a, b, n)
+    a_bytes, b_bytes = G.a_to_bytes(a, n), G.b_to_bytes(b, n)
 
-    # START, then immediately try to overwrite A, B and C.
-    await mwr_burst(tb, [
-        (G.REG_CTRL, G.CTRL_START, 0xF),
-        (G.MEM_A_BASE, 0xFFFFFFFF, 0xF),
-        (G.MEM_B_BASE, 0xFFFFFFFF, 0xF),
-        (G.MEM_C_BASE, 0xFFFFFFFF, 0xF),
-    ])
-    await wait_done(tb)
+    for region, base, label in ((0, G.MEM_A_BASE, "mem_a"),
+                                (1, G.MEM_B_BASE, "mem_b"),
+                                (2, G.MEM_C_BASE, "mem_c")):
+        await load_ab(tb, a, b, n)
+        await mwr_dword(tb, G.REG_STATUS, G.ST_W1C_MASK)
+        st = await tb.read_dword(G.REG_STATUS)
+        assert st == 0, (
+            f"precondition: STATUS = 0x{st:08x} before the {label} race")
 
-    st = await tb.read_dword(G.REG_STATUS)
-    assert st & G.ST_ERR_WRITE_BUSY, (
-        f"REQ-062: STATUS = 0x{st:08x} after writing A/B/C while BUSY; "
-        "ERR_WRITE_BUSY (bit 3) must be set")
+        start = tb.make_mem_write(tb.bar0_addr + G.REG_CTRL,
+                                  G.CTRL_START.to_bytes(4, "little"))
+        poison = tb.make_mem_write(tb.bar0_addr + base,
+                                   (0xFFFFFFFF).to_bytes(4, "little"))
+        cap = tb.shim.start_capture()
+        try:
+            t_start = await inject_and_get_beat(tb, start, payload_index=0)
+            t_write = await inject_and_get_beat(tb, poison, payload_index=0)
+        finally:
+            tb.shim.stop_capture()
 
-    got_a = await tb.mem_read(G.MEM_A_BASE, 4)
-    assert bytes(got_a) == G.a_to_bytes(a, n)[:4], (
-        f"REQ-062: A[0][0..3] reads {bytes(got_a)!r} after a write attempted "
-        "while BUSY; the write must be discarded")
-    got = await read_c(tb, n)
-    assert_matrix_equal(got, exp, "C after A/B/C writes were attempted "
-                                  "while BUSY")
+        delta = t_write - t_start
+        assert 1 <= delta <= G.t_mm(n), (
+            f"test positioning: the {label} write's payload beat transferred "
+            f"{delta} cycles after the CTRL.START beat, outside the BUSY "
+            f"window [1, 4*N+2 = {G.t_mm(n)}] that REQ-074 defines.  REQ-062 "
+            "only applies while STATUS.BUSY is 1, so this run would not have "
+            "exercised it.  (This is the failure mode BUG-003 described: at "
+            "small N the operation finishes before the TLP stream does.)")
+
+        await wait_done(tb)
+        st = await tb.read_dword(G.REG_STATUS)
+        assert st & G.ST_ERR_WRITE_BUSY, (
+            f"REQ-062: STATUS = 0x{st:08x} after a write to {label} whose "
+            f"payload beat landed {delta} cycles into a {G.t_mm(n)}-cycle "
+            "operation; ERR_WRITE_BUSY (bit 3) must be set")
+
+        if region == 0:
+            got = bytes(await tb.mem_read(G.MEM_A_BASE, 4))
+            assert got == a_bytes[:4], (
+                f"REQ-062: A[0][0..3] reads {got!r} after a write attempted "
+                f"{delta} cycles into the operation; the write must be "
+                f"discarded, leaving {a_bytes[:4]!r}")
+        elif region == 1:
+            got = bytes(await tb.mem_read(G.MEM_B_BASE, 4))
+            assert got == b_bytes[:4], (
+                f"REQ-062: B[0][0..3] reads {got!r} after a write attempted "
+                f"{delta} cycles into the operation; the write must be "
+                f"discarded, leaving {b_bytes[:4]!r}")
+
+        got = await read_c(tb, n)
+        assert_matrix_equal(
+            got, exp, f"C after a write to {label} was attempted "
+                      f"{delta} cycles into the operation",
+            extra="  REQ-062: the write is discarded, so C must be exactly "
+                  "the golden product.")
+        await mwr_dword(tb, G.REG_STATUS, G.ST_W1C_MASK)
 
 
 @cocotb.test(timeout_time=600, timeout_unit="us")
@@ -322,24 +374,47 @@ async def test_matmul_busy_is_zero_when_idle(dut):
             "BUSY must be 0")
 
 
-@cocotb.test(timeout_time=600, timeout_unit="us")
+@cocotb.test(timeout_time=1500, timeout_unit="us")
 async def test_matmul_c_addressing_and_persistence(dut):
     """REQ-089, REQ-090, REQ-092, REQ-098: C word placement and persistence.
 
-    A is built so that C[i][j] = (i+1)*1000 + (j+1), which is unique per
-    element; if the drain phase wrote rows in the wrong order or lanes in the
-    wrong order, the pattern would be permuted.
+    Three operand patterns, all INT8-legal for every legal `N` (2..32), chosen
+    so that between them any permutation of C is detected:
+
+      * ``A[i][j] = i - 128``  -- every **row** of C differs, so any row
+        permutation or reversal of the drain order (REQ-098) shows up.
+      * ``A[i][j] = j - 128``  -- every **lane** of C differs, so any lane
+        permutation or a transposition shows up.
+      * ``A[i][j] = ((i*37 + j*5) % 251) - 125`` -- varies in both indices at
+        once, so it also catches interactions the two single-index patterns
+        would miss.
+
+    The original single pattern was ``(i*N + j) - 100``, which is distinct per
+    element but leaves INT8 range at `N >= 16` (155 at N=16, 923 at N=32) and
+    was rejected by the golden model before the DUT was ever stimulated
+    (BUG-005).  A fully distinct `N*N` pattern is impossible at `N = 32` --
+    INT8 has 256 values and C has 1024 elements -- so distinctness is dropped
+    in favour of the three complementary patterns above, which keep the
+    permutation check's teeth at every `N`.
     """
     tb = await make_tb(dut)
     n = await discover_n(tb)
 
-    # C[i][j] = sum_k A[i][k]*B[k][j].  With B = I, C = A.  Use distinct
-    # values per element so that any transposition or row reversal shows up.
-    a = [[(i * n + j) - 100 for j in range(n)] for i in range(n)]
-    await matmul_case(tb, n, a, identity(n), "C = A x I, element placement")
+    row_pattern = [[i - 128 for _ in range(n)] for i in range(n)]
+    lane_pattern = [[j - 128 for j in range(n)] for _ in range(n)]
+    mixed = [[((i * 37 + j * 5) % 251) - 125 for j in range(n)]
+             for i in range(n)]
 
-    # Per-element read at exactly 0x3000 + 4*(i*N + j) (REQ-090)
-    exp = G.matmul_golden(a, identity(n), n)
+    for a, what in ((row_pattern, "row-varying A (detects row permutation "
+                                  "and drain-order reversal, REQ-098)"),
+                    (lane_pattern, "lane-varying A (detects lane permutation "
+                                   "and transposition)"),
+                    (mixed, "two-index-varying A")):
+        await matmul_case(tb, n, a, identity(n), f"C = A x I with {what}")
+
+    # Per-element read at exactly 0x3000 + 4*(i*N + j) (REQ-090), using the
+    # two-index pattern that is still in C from the loop above.
+    exp = G.matmul_golden(mixed, identity(n), n)
     for i in range(n):
         for j in range(n):
             off = G.MEM_C_BASE + 4 * (i * n + j)
@@ -348,11 +423,13 @@ async def test_matmul_c_addressing_and_persistence(dut):
                 f"REQ-089/REQ-090/REQ-098: BAR0+0x{off:04x} (C[{i}][{j}]) "
                 f"reads {got}, golden says {exp[i][j]}")
 
-    # REQ-092: neither START nor SOFT_RESET clears C.
+    # REQ-092 / REQ-071 (narrowed in v1.1.0): with the engine IDLE, SOFT_RESET
+    # must not itself modify any word of mem_c.
     await mwr_dword(tb, G.REG_CTRL, G.CTRL_SOFT_RESET)
     got = await read_c(tb, n)
-    assert_matrix_equal(got, exp, "C after SOFT_RESET",
-                        extra="  REQ-092: SOFT_RESET must not clear mem_c.")
+    assert_matrix_equal(got, exp, "C after SOFT_RESET with the engine IDLE",
+                        extra="  REQ-092/REQ-071: SOFT_RESET must not itself "
+                              "modify mem_c.")
 
 
 @cocotb.test(timeout_time=400, timeout_unit="us")
