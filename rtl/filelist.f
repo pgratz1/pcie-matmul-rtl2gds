@@ -1,0 +1,14 @@
+rtl/mm_pe.sv
+rtl/mm_array.sv
+rtl/mm_ctrl.sv
+rtl/matmul_engine.sv
+rtl/mem_a.sv
+rtl/mem_b.sv
+rtl/mem_c.sv
+rtl/reg_file.sv
+rtl/app_bar0.sv
+rtl/pcie_cfg_space.sv
+rtl/tlp_rx.sv
+rtl/tlp_tx.sv
+rtl/pcie_tl.sv
+rtl/matmul_top.sv
