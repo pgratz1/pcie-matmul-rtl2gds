@@ -1,6 +1,6 @@
 # PCIe-Attached Matrix Multiplier — Architecture and Micro-Architecture Specification
 
-**Spec version: 1.1.2**
+**Spec version: 1.1.3**
 **Date: 2026-09-10**
 **Owner: spec-writer**
 **Status: Phase 1 deliverable. Binding on rtl-designer, test-writer, rtl-reviewer, circuit-designer.**
@@ -22,6 +22,38 @@ Change log:
 | 1.1.1 | 2026-09-10 | Fixed an internal inconsistency in the definition of `t_start`, and the REQ-123 off-by-one it caused. §9.6 now names `t_beat`, `t_start` and `t_commit` separately and fixes `t_start = t_beat`. `D_WR` is deliberately excluded from every latency formula. No RTL change required. | **Corrected:** REQ-123 (`t_beat + 4*N + 2`, was `t_beat + D_WR + 4*N + 2`). **Clarified, meaning unchanged:** REQ-074, REQ-101, REQ-122. |
 
 | 1.1.2 | 2026-09-10 | REQ-119's v1.1.0 repair was still unsatisfiable at `N`=16 and `N`=32 (one operand is 64 and 256 DW, over the 32-DW burst cap); burst count is now `ceil(ceil(N*N/4)/32)`. REQ-120 re-checked and confirmed correct for all legal `N`. Added REQ-126 for malformed-`Length` configuration requests. | **Corrected:** REQ-119. **Added:** REQ-126. **Re-confirmed, unchanged:** REQ-120. |
+
+| 1.1.3 | 2026-09-10 | Overlap-class cleanup. Two older requirements had antecedents broad enough to literally forbid what a newer, more specific requirement demands, with the conflict resolved only by a precedence sentence. Both antecedents narrowed so the pairs are disjoint by construction. No behavior change. | **Antecedent narrowed:** REQ-042 (now disjoint from REQ-126), REQ-070 (now disjoint from REQ-124). |
+
+### Overlap audit (v1.1.3)
+
+Every requirement added or reworded in v1.1.0 – v1.1.2 was re-read against the
+original 121 looking for one specific shape: **an older requirement whose antecedent
+is broad enough to cover a case a newer requirement handles differently, where the
+contradiction is settled only by a tie-breaker clause rather than by the two texts
+being disjoint.** Two instances existed; both are fixed in v1.1.3.
+
+| Newer req | Older req with an over-broad antecedent | Resolution |
+|-----------|----------------------------------------|------------|
+| REQ-126 (config `Length != 1` -> UR **and** `ERR_UNSUP_REQ` set) | REQ-042 (config to non-zero Device/Function -> UR and `ERR_UNSUP_REQ` **not** set) | REQ-042 antecedent gains "with `Length` == 1". |
+| REQ-124 (`START`+`SOFT_RESET` while `BUSY` -> `ERR_START_BUSY` reads 0) | REQ-070 (`START` while `BUSY` -> `ERR_START_BUSY` **set**) | REQ-070 antecedent gains "with `CTRL.SOFT_RESET` written 0 in the same DWORD". |
+
+Pairs checked and found already disjoint or already consistent, needing no change:
+REQ-125 vs REQ-071 (REQ-071's `mem_c` clause was narrowed in v1.1.0, so the two are
+already disjoint); REQ-123 vs REQ-074 and REQ-101 (reconciled in v1.1.1 by fixing
+`t_start = t_beat` — all three now measure from the same cycle and agree in value);
+REQ-122 (defines a constant, constrains no transaction, so it cannot overlap);
+REQ-119 and REQ-120 (disjoint by direction — writes versus reads — and by region);
+REQ-062 vs REQ-063 (disjoint by direction); REQ-044 vs REQ-038/REQ-039 (REQ-044
+explicitly defers rather than restating); REQ-017 vs REQ-126 (a `Length`=0
+configuration request falls under both, but they demand the *same* outcome — UR plus
+`ERR_UNSUP_REQ` — so there is no contradiction to resolve).
+
+One redundancy, deliberately left alone: REQ-081 (clearing deasserts `irq` within 2
+cycles) is now a strict subset of the reworded REQ-080 (tracks within 2 cycles in both
+directions). They agree, REQ-081 is simply the deassertion half stated separately, and
+it has a passing test mapped to it. Narrowing or deleting it would churn
+`tb/TESTPLAN.md` for no gain.
 
 ### What changed in v1.1.0, and what the test writer must re-check
 
@@ -726,9 +758,12 @@ Definitions used below, matching `cocotbext-pcie` bit-for-bit:
 > **not a coverage hole**; the requirement stays in the spec because the RTL must
 > still not mis-frame a Message if one ever arrives. Do not remove or weaken REQ-041
 > to close a coverage report.
-- **REQ-042** A `CfgRd0`/`CfgWr0` whose Device Number or Function Number is non-zero
-  shall be answered with a UR Completion and shall **not** set
-  `STATUS.ERR_UNSUP_REQ` (this happens on every bus scan and is not an error).
+- **REQ-042** *(antecedent narrowed in v1.1.3 so it is disjoint from REQ-126 by
+  construction.)* A `CfgRd0`/`CfgWr0` **with `Length` == 1** whose Device Number or
+  Function Number is non-zero shall be answered with a UR Completion and shall
+  **not** set `STATUS.ERR_UNSUP_REQ` (this happens on every bus scan and is not an
+  error). A configuration request with `Length` != 1 is outside this requirement
+  entirely and is governed by REQ-126, whatever its Device and Function Number.
 - **REQ-043** An inbound `Cpl`/`CplD` shall be discarded with no error bit set and no
   Completion emitted.
 - **REQ-044** An `MRd` or `MWr` that would cross the end of the BAR0 window
@@ -1030,8 +1065,11 @@ reset values.
 - **REQ-069** Writing 1 to `CTRL.START` while `STATUS.BUSY == 0` shall start one
   matrix multiply: `STATUS.BUSY` becomes 1 on the next clock edge, `STATUS.DONE` is
   cleared, and all `mm_pe` accumulators are cleared to 0.
-- **REQ-070** Writing 1 to `CTRL.START` while `STATUS.BUSY == 1` shall have no effect
-  on the running operation and shall set `STATUS.ERR_START_BUSY`.
+- **REQ-070** *(antecedent narrowed in v1.1.3 so it is disjoint from REQ-124 by
+  construction.)* Writing 1 to `CTRL.START` **with `CTRL.SOFT_RESET` written 0 in the
+  same DWORD** while `STATUS.BUSY == 1` shall have no effect on the running operation
+  and shall set `STATUS.ERR_START_BUSY`. A write that sets both bits is outside this
+  requirement entirely and is governed by REQ-124.
 - **REQ-071** *(clause on `mem_c` narrowed in v1.1.0 — see REQ-125.)* Writing 1 to
   `CTRL.SOFT_RESET` shall, within 2 clock cycles: return `mm_ctrl` to IDLE, clear
   `STATUS.BUSY`, `STATUS.DONE` and all `STATUS` error bits, clear `PERF_CYCLES` to 0,
@@ -1584,7 +1622,7 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-039 | 7.6 | `MWr` missing BAR0 or with MSE=0 -> discarded, `STATUS.ERR_UNSUP_REQ` set, no Completion. |
 | REQ-040 | 7.6 | Unsupported non-posted TLP -> UR Completion and `STATUS.ERR_UNSUP_REQ` set. |
 | REQ-041 | 7.6 | Unsupported posted TLP -> discarded, `STATUS.ERR_UNSUP_REQ` set, no Completion. |
-| REQ-042 | 7.6 | `CfgRd0`/`CfgWr0` with non-zero Device or Function number -> UR, and no error bit set. |
+| REQ-042 | 7.6 | `CfgRd0`/`CfgWr0` **with `Length` == 1** and non-zero Device or Function number -> UR, and no error bit set. **Antecedent narrowed in v1.1.3.** |
 | REQ-043 | 7.6 | Inbound `Cpl`/`CplD` discarded silently; no error bit, no Completion. |
 | REQ-044 | 7.6 | A memory request running past the end of the 16 KiB BAR0 window is treated as a BAR0 miss. |
 | REQ-045 | 8.3 | `CfgRd0` returns the §8.2 values for 0x00–0x3C and `0x00000000` for 0x40–0xFFF. |
@@ -1612,7 +1650,7 @@ are unique and contiguous from REQ-001 to REQ-121.
 | REQ-067 | 10.2 | `CONFIG` reads `{8'h00, ACCW, DW, N}`; `0x00200808` for the v1 build. |
 | REQ-068 | 10.3 | `CTRL` always reads `0x00000000`. |
 | REQ-069 | 10.3 | `CTRL.START` while not `BUSY` starts one multiply, sets `BUSY`, clears `DONE`, clears accumulators. |
-| REQ-070 | 10.3 | `CTRL.START` while `BUSY` is ignored and sets `STATUS.ERR_START_BUSY`. |
+| REQ-070 | 10.3 | `CTRL.START` **with `SOFT_RESET` = 0** while `BUSY` is ignored and sets `STATUS.ERR_START_BUSY`. **Antecedent narrowed in v1.1.3.** |
 | REQ-071 | 10.3 | `CTRL.SOFT_RESET` returns the engine to IDLE and clears BUSY/DONE/errors/PERF_CYCLES/accumulators within 2 cycles, leaving A, B, SCRATCH, IRQ_ENABLE, OP_COUNT and config space unchanged, and not itself modifying `mem_c` (see REQ-125). **Reworded in v1.1.0.** |
 | REQ-072 | 10.3 | `SOFT_RESET` takes precedence over `START` when both are written in one DWORD. |
 | REQ-073 | 10.3 | `CTRL` bits act only when their byte's Byte Enable is 1. |

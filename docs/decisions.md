@@ -268,6 +268,26 @@ the verified-behavior report; it is specified that way for consistency with §4.
 treatment of other malformed TLPs, and rtl-designer should confirm or flag it.
 Decided by: spec-writer, on test-writer's findings.
 
+## 2026-09-10 — Spec correction, v1.1.2 -> v1.1.3: overlap-class cleanup
+**Context:** round-2 review found REQ-042's antecedent ("`CfgRd0`/`CfgWr0` with non-zero
+Device or Function Number") still literally covering a malformed-`Length` request and
+forbidding `ERR_UNSUP_REQ`, while the newer REQ-126 requires it. Behaviour was never in
+doubt — the RTL follows REQ-126 and the reviewer verified it — but the contradiction was
+settled only by REQ-126's precedence sentence.
+**Decision:** resolve overlaps by making antecedents **disjoint by construction**, never
+by a precedence clause. A reader who lands on the older requirement must not be misled,
+and precedence clauses only work if you happen to read both requirements.
+**Two instances fixed:** REQ-042 gains "with `Length` == 1" (disjoint from REQ-126);
+REQ-070 gains "with `CTRL.SOFT_RESET` written 0 in the same DWORD" (disjoint from
+REQ-124). REQ-070 was found by the audit, not by review. No behavior change; both
+narrowed antecedents still cover the cases the existing passing tests exercise.
+**Audit recorded in `docs/spec.md`** under "Overlap audit (v1.1.3)", listing the pairs
+checked and found already disjoint, so the next amendment does not repeat the work.
+**Lesson:** this is the second overlap-class defect found in review rather than by test.
+When adding a requirement that carves an exception out of an existing one, amend the
+existing one's antecedent in the same edit. Decided by: spec-writer, on rtl-reviewer's
+round-2 finding.
+
 ## 2026-09-10 — Open questions for the human (spec-writer, Phase 1)
 None of these block Phase 2. They are recorded so they are not silently omitted.
 
