@@ -38,7 +38,13 @@
 //             beat is lost), REQ-005 (idle and stall cycles may fall anywhere
 //             inside a TLP; the framing FSM only advances on valid && ready),
 //             REQ-008, REQ-013 ... REQ-022, REQ-028 ... REQ-032,
-//             REQ-036 ... REQ-044, REQ-050, REQ-052, REQ-053, REQ-054.
+//             REQ-036 ... REQ-044, REQ-050, REQ-052, REQ-053, REQ-054,
+//             REQ-126 (a CfgRd0/CfgWr0 whose Length is not exactly 1 fails the
+//             cfg_len_ok guard, falls through to CLS_UR_ERR and so gets a UR
+//             Cpl, sets STATUS.ERR_UNSUP_REQ and touches no configuration
+//             register; the Device/Function test lives inside the accepted
+//             branch, so the REQ-042 carve-out does not apply to it, and any
+//             surplus payload is drained through eop in S_DRAIN).
 // ---------------------------------------------------------------------------
 module tlp_rx (
     // Clock and reset

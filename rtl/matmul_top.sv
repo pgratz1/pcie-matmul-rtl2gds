@@ -49,6 +49,10 @@
 //             mem_a / mem_b / mem_c is combinational from the accepted payload
 //             beat, so storage always commits on the edge that ends that beat,
 //             independently of region, burst position, Byte Enables and N.
+//   REQ-123 - the pin-observable start-to-DONE latency, satisfied jointly by
+//             reg_file (which turns the accepted CTRL payload beat into the
+//             `start` strobe) and mm_ctrl (which sets DONE 4N+2 cycles later).
+//             Measured value: DONE is set at t_beat + 4N + 2.
 // ---------------------------------------------------------------------------
 module matmul_top #(
     parameter int N    = 8,     // systolic array dimension; power of two, 2..32

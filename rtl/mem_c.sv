@@ -76,7 +76,12 @@ module mem_c #(
     endgenerate
 
     // ---- drain row write -------------------------------------------------
-    localparam int NROW = (1 << WIW) / N;   // rows of N words in mem
+    // Rows of N words in mem. This is an EXACT tiling -- NROW fills of N*ACCW
+    // bits cover MEMBITS with no gap and no overlap -- only because N is a power
+    // of two (spec section 14 requires that, so NW = N*N and 1<<WIW are the same
+    // number). A non-power-of-two N would leave the tail of mem unreset, and
+    // neither lint nor a reset test would catch it.
+    localparam int NROW = (1 << WIW) / N;
 
     integer         ri;
     logic [BOW-1:0] d_boff;
